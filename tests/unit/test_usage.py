@@ -15,4 +15,16 @@ def test_ledger_replaces_snapshots_and_never_downgrades_final() -> None:
 def test_unavailable_is_not_reported_as_zero() -> None:
     ledger = UsageLedger()
     ledger.mark_unavailable("request", "turn")
-    assert ledger.for_turn("turn").usage.total_tokens is None
+    summary = ledger.for_turn("turn")
+    assert summary.usage.total_tokens is None
+    assert summary.unavailable_requests == 1
+
+
+def test_empty_ledger_reports_unknown_usage_without_requests() -> None:
+    ledger = UsageLedger()
+    for summary in (ledger.for_turn("turn"), ledger.for_conversation()):
+        assert summary.usage.total_tokens is None
+        assert summary.usage.status is UsageStatus.UNAVAILABLE
+        assert summary.final_requests == 0
+        assert summary.partial_requests == 0
+        assert summary.unavailable_requests == 0

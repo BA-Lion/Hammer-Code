@@ -72,6 +72,37 @@ uv run hammer-code --config .hammer-code\config.toml --profile anthropic
 
 未提供 `--config` 时，Hammer Code 从当前目录逐级向上查找最近的 `.hammer-code/config.toml`，最多查到 Git 根目录。找不到配置、profile 不存在或环境变量缺失时不会发起网络请求，而是显示错误并以状态码 2 退出。
 
+## 显示思考内容
+
+在 `.hammer-code/config.toml` 中开启 UI 展示开关，然后重新启动 Hammer Code：
+
+```toml
+[ui]
+show_reasoning = true
+```
+
+`show_reasoning = true` 表示把供应商返回的 reasoning/thinking 内容实时输出到终端。设为 `false` 时不会显示真实内容，每轮只显示一个可动态更新的 `Thinking…` 状态，不会按流式分块重复换行。
+
+UI 开关只控制是否展示；所选 profile 也必须请求或支持 reasoning 内容。将下面相应字段合并到已有 profile 中，不要重复声明同一个 TOML 表头：
+
+```toml
+# OpenAI Responses：在对应 profile 中请求 reasoning summary
+[profiles.openai]
+protocol = "openai_responses"
+# 保留该 profile 原有的 model、base_url、api_key_env 等字段
+reasoning_effort = "medium"
+reasoning_summary = "auto"
+
+# Anthropic Messages：在对应 profile 中启用 thinking
+[profiles.anthropic]
+protocol = "anthropic_messages"
+# 保留该 profile 原有的 model、base_url、api_key_env 等字段
+thinking_mode = "enabled"
+thinking_budget = 1024
+```
+
+对于 `openai_chat_completions` 兼容服务，无需额外的 Hammer Code 展示字段；只有服务实际返回 `reasoning_content` 或 `reasoning` 流字段时才会显示。供应商不返回 reasoning 时，即使 `show_reasoning = true` 也没有可展示内容。签名、redacted thinking 等 opaque provider state 始终不会显示。
+
 ## 交互内置命令
 
 这些命令只在本地处理，不会发送给模型：

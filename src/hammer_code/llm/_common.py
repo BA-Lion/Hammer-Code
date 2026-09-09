@@ -90,6 +90,16 @@ def map_exception(exc: Exception) -> ModelClientError:
         return RequestTimeoutError("Model request timed out")
     if status is not None and status >= 500:
         return ProviderUnavailableError("Model provider is temporarily unavailable")
+    if any(
+        connection_error in name
+        for connection_error in (
+            "apiconnectionerror",
+            "connectionerror",
+            "connecterror",
+            "proxyerror",
+        )
+    ):
+        return TransportError("Model connection failed; check network, proxy, DNS and TLS settings")
     return TransportError("Model transport failed")
 
 

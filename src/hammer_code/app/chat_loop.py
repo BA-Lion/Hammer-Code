@@ -14,6 +14,7 @@ from hammer_code.domain.events import (
     ToolCallCompleted,
     UsageUpdated,
 )
+from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import HammerCodeError, StreamInterruptedError
 from hammer_code.llm.client import ModelClient
 from hammer_code.ui.console import ConsolePort
@@ -87,6 +88,7 @@ class ChatLoop:
         turn = self.manager.begin_turn(text)
         request_id = str(uuid4())
         completed = None
+        reasoning_status_started = False
         try:
             from hammer_code.domain.events import ModelRequest, ReasoningDelta
 
@@ -98,6 +100,11 @@ class ChatLoop:
                 (),
                 self.max_output_tokens,
             )
+            self.manager.record_usage(
+                turn,
+                request_id,
+                TokenUsage(None, None, status=UsageStatus.UNAVAILABLE),
+            )
             async for event in self.client.stream(request):
                 if event.request_id != request_id:
                     raise StreamInterruptedError("Client emitted an event for a different request")
@@ -108,8 +115,9 @@ class ChatLoop:
                 elif isinstance(event, ReasoningDelta):
                     if self.show_reasoning:
                         self.ui.reasoning_delta(event.text, event.visibility)
-                    else:
+                    elif not reasoning_status_started:
                         self.ui.reasoning_status()
+                        reasoning_status_started = True
                 elif isinstance(event, ToolCallCompleted):
                     self.ui.tool_call_notice(event.tool_call)
                 elif isinstance(event, UsageUpdated):

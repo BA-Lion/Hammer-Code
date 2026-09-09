@@ -85,6 +85,13 @@ class UsageLedger:
     @staticmethod
     def _summarize(usages: Iterable[TokenUsage]) -> UsageSummary:
         entries = list(usages)
+        if not entries:
+            return UsageSummary(
+                TokenUsage(None, None, status=UsageStatus.UNAVAILABLE),
+                final_requests=0,
+                partial_requests=0,
+                unavailable_requests=0,
+            )
         known_input = [u.input_tokens for u in entries if u.input_tokens is not None]
         known_output = [u.output_tokens for u in entries if u.output_tokens is not None]
         status_counts = {status: sum(u.status is status for u in entries) for status in UsageStatus}
@@ -98,7 +105,7 @@ class UsageLedger:
             if entries and status_counts[UsageStatus.FINAL] == len(entries)
             else (
                 UsageStatus.UNAVAILABLE
-                if not entries or status_counts[UsageStatus.UNAVAILABLE]
+                if status_counts[UsageStatus.UNAVAILABLE]
                 else UsageStatus.PARTIAL
             ),
         )

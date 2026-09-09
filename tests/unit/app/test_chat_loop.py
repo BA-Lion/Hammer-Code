@@ -9,14 +9,16 @@ from hammer_code.domain.events import (
     ModelEvent,
     ModelRequest,
     ModelResponse,
+    ReasoningDelta,
     ResponseCompleted,
     ResponseStarted,
     StopReason,
     TextDelta,
     UsageUpdated,
 )
-from hammer_code.domain.messages import Message, Role, TextBlock
+from hammer_code.domain.messages import Message, ReasoningVisibility, Role, TextBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus
+from hammer_code.errors import TransportError
 from hammer_code.llm.client import ClientCapabilities, ModelClient
 
 
@@ -25,6 +27,8 @@ class FakeUI:
         self.text = []
         self.errors = []
         self.shown_usage = []
+        self.reasoning_status_count = 0
+        self.reasoning = []
 
     async def prompt(self) -> str:
         return "/exit"
@@ -33,10 +37,10 @@ class FakeUI:
         self.text.append(text)
 
     def reasoning_status(self) -> None:
-        pass
+        self.reasoning_status_count += 1
 
     def reasoning_delta(self, text, visibility) -> None:
-        pass
+        self.reasoning.append((text, visibility))
 
     def tool_call_notice(self, call) -> None:
         pass
@@ -55,8 +59,15 @@ class FakeUI:
 
 
 class FakeClient(ModelClient):
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(
+        self,
+        fail: bool = False,
+        fail_before_events: bool = False,
+        reasoning_chunks: tuple[str, ...] = (),
+    ) -> None:
         self.fail = fail
+        self.fail_before_events = fail_before_events
+        self.reasoning_chunks = reasoning_chunks
 
     @property
     def capabilities(self) -> ClientCapabilities:
@@ -66,7 +77,11 @@ class FakeClient(ModelClient):
         pass
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        if self.fail_before_events:
+            raise TransportError("network failure")
         yield ResponseStarted(request.request_id, "provider", "model")
+        for chunk in self.reasoning_chunks:
+            yield ReasoningDelta(request.request_id, 0, chunk, ReasoningVisibility.SUMMARY)
         yield TextDelta(request.request_id, 0, "hello")
         yield UsageUpdated(request.request_id, TokenUsage(1, 2, status=UsageStatus.FINAL))
         if self.fail:
@@ -113,9 +128,63 @@ async def test_chat_loop_renders_and_commits_only_completed_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_loop_announces_hidden_reasoning_only_once_per_turn() -> None:
+    manager = _manager()
+    ui = FakeUI()
+    await ChatLoop(
+        manager,
+        FakeClient(reasoning_chunks=("one", "two", "three")),
+        ui,
+        "system",
+        5,
+    ).run_turn("hi")
+    assert ui.reasoning_status_count == 1
+    assert ui.reasoning == []
+
+
+@pytest.mark.asyncio
+async def test_chat_loop_streams_real_reasoning_when_enabled() -> None:
+    manager = _manager()
+    ui = FakeUI()
+    await ChatLoop(
+        manager,
+        FakeClient(reasoning_chunks=("one", "two")),
+        ui,
+        "system",
+        5,
+        show_reasoning=True,
+    ).run_turn("hi")
+    assert ui.reasoning_status_count == 0
+    assert ui.reasoning == [
+        ("one", ReasoningVisibility.SUMMARY),
+        ("two", ReasoningVisibility.SUMMARY),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_loop_rolls_back_failed_response_but_keeps_usage() -> None:
     manager = _manager()
     ui = FakeUI()
     await ChatLoop(manager, FakeClient(True), ui, "system", 5).run_turn("hi")
     assert manager.conversation and manager.conversation.messages == []
-    assert manager.conversation.usage_ledger.for_conversation().usage.total_tokens == 3
+    summary = manager.conversation.usage_ledger.for_conversation()
+    assert summary.usage.total_tokens == 3
+    assert summary.final_requests == 1
+    assert summary.unavailable_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_loop_recovers_after_failure_before_first_event() -> None:
+    manager = _manager()
+    ui = FakeUI()
+    loop = ChatLoop(manager, FakeClient(fail_before_events=True), ui, "system", 5)
+    await loop.run_turn("hi")
+    assert manager.conversation and manager.conversation.messages == []
+    summary = manager.conversation.usage_ledger.for_conversation()
+    assert summary.usage.total_tokens is None
+    assert summary.unavailable_requests == 1
+    assert ui.errors == ["network failure"]
+
+    loop.client = FakeClient()
+    await loop.run_turn("hello again")
+    assert manager.conversation.messages and len(manager.conversation.messages) == 2
