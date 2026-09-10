@@ -3,6 +3,10 @@ default_profile = "openai"
 [ui]
 show_reasoning = false
 
+[tools]
+# Disabled tools only reduce the built-in capability set.
+disabled = []
+
 [profiles.openai]
 protocol = "openai_responses"
 model = "gpt-5-mini"

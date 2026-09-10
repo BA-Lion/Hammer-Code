@@ -10,6 +10,7 @@ from rich.status import Status
 
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import UsageSummary
+from hammer_code.permissions.models import ApprovalChoice, PermissionRequest
 
 
 class ConsolePort(Protocol):
@@ -22,6 +23,7 @@ class ConsolePort(Protocol):
     def info(self, message: str) -> None: ...
     def usage(self, summary: UsageSummary) -> None: ...
     def help(self) -> None: ...
+    async def approve(self, request: PermissionRequest, reason: str) -> ApprovalChoice: ...
 
 
 class ConsoleUI:
@@ -73,7 +75,28 @@ class ConsoleUI:
 
     def tool_call_notice(self, call: ToolCallBlock) -> None:
         self._finish_thinking()
-        self.console.print(f"\n[dim]Tool call parsed: {call.name} (not executed)[/]")
+        self.console.print(f"\n[dim]Tool call: {call.name}[/]")
+
+    async def approve(self, request: PermissionRequest, reason: str) -> ApprovalChoice:
+        self._finish_thinking()
+        details = request.normalized_command or str(request.normalized_arguments)
+        prompt = (
+            f"Approve {request.tool_name} ({reason}): {details}\n"
+            "1) allow once  2) allow and persist  3) deny [3] "
+        )
+        while True:
+            try:
+                answer = (await asyncio.to_thread(input, prompt)).strip()
+            except (EOFError, KeyboardInterrupt):
+                return ApprovalChoice.DENY
+            match answer:
+                case "1":
+                    return ApprovalChoice.ALLOW_ONCE
+                case "2":
+                    return ApprovalChoice.ALLOW_AND_PERSIST
+                case "3" | "":
+                    return ApprovalChoice.DENY
+            self.console.print("Enter 1, 2, or 3.")
 
     def error(self, message: str) -> None:
         self._finish_thinking()

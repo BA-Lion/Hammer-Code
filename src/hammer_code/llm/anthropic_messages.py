@@ -91,6 +91,15 @@ class AnthropicMessagesClient(ModelClient):
             payload["thinking"] = {"type": "enabled", "budget_tokens": self.profile.thinking_budget}
         elif self.profile.thinking_mode == "adaptive":
             payload["thinking"] = {"type": "adaptive"}
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
+                }
+                for tool in request.tools
+            ]
         stream: object | None = None
         started = False
         completed = False

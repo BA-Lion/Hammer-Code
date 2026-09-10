@@ -72,6 +72,19 @@ class OpenAIChatCompletionsClient(ModelClient):
             ]  # type: ignore[operator]
         if self.profile.stream_include_usage:
             payload["stream_options"] = {"include_usage": True}
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                        "strict": False,
+                    },
+                }
+                for tool in request.tools
+            ]
         stream: object | None = None
         started = False
         finished = False

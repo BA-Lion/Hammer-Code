@@ -124,7 +124,11 @@ def as_openai_chat_messages(messages: tuple[Message, ...]) -> list[dict[str, obj
                     {
                         "role": "tool",
                         "tool_call_id": block.call_id,
-                        "content": text_from_tool_result(block),
+                        "content": (
+                            f"Error: {text_from_tool_result(block)}"
+                            if block.is_error
+                            else text_from_tool_result(block)
+                        ),
                     }
                 )
         if tool_calls:

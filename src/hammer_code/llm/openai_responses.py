@@ -26,6 +26,8 @@ from hammer_code.domain.messages import (
     ReasoningVisibility,
     RefusalBlock,
     TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
 )
 from hammer_code.domain.usage import UsageStatus
 from hammer_code.errors import StreamInterruptedError, StreamProtocolError
@@ -92,6 +94,17 @@ class OpenAIResponsesClient(ModelClient):
             if self.profile.reasoning_summary:
                 reasoning["summary"] = self.profile.reasoning_summary
             payload["reasoning"] = reasoning
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "strict": False,
+                }
+                for tool in request.tools
+            ]
         event_stream: object | None = None
         started = False
         completed = False
@@ -163,7 +176,11 @@ class OpenAIResponsesClient(ModelClient):
                     )
                     reason = str(get(incomplete, "reason", "") or "")
                     stop = (
-                        StopReason.MAX_TOKENS if reason == "max_output_tokens" else StopReason.OTHER
+                        StopReason.TOOL_CALL
+                        if any(isinstance(part, ToolCallBlock) for part in parts)
+                        else StopReason.MAX_TOKENS
+                        if reason == "max_output_tokens"
+                        else StopReason.OTHER
                     )
                     message = blocks_from_parts(parts)
                     response_id = str(get(final, "id", "unknown") or "unknown")
@@ -201,6 +218,23 @@ class OpenAIResponsesClient(ModelClient):
                     )
                 elif isinstance(block, ProviderStateBlock) and block.protocol == "openai_responses":
                     blocks.append(dict(block.data))
+                elif isinstance(block, ToolCallBlock):
+                    result.append(
+                        {
+                            "type": "function_call",
+                            "call_id": block.call_id,
+                            "name": block.name,
+                            "arguments": block.raw_arguments,
+                        }
+                    )
+                elif isinstance(block, ToolResultBlock):
+                    result.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": block.call_id,
+                            "output": "".join(item.text for item in block.content),
+                        }
+                    )
             if blocks:
                 result.append({"role": message.role.value, "content": blocks})
         return result

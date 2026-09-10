@@ -20,6 +20,7 @@ from hammer_code.domain.messages import Message, ReasoningVisibility, Role, Text
 from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import TransportError
 from hammer_code.llm.client import ClientCapabilities, ModelClient
+from hammer_code.permissions.models import ApprovalChoice
 
 
 class FakeUI:
@@ -53,6 +54,9 @@ class FakeUI:
 
     def help(self) -> None:
         pass
+
+    async def approve(self, request, reason: str) -> ApprovalChoice:
+        return ApprovalChoice.DENY
 
     def info(self, message: str) -> None:
         pass

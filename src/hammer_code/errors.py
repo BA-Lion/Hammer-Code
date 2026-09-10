@@ -25,6 +25,18 @@ class InvalidTurnStateError(ConversationError):
     pass
 
 
+class ToolError(HammerCodeError):
+    pass
+
+
+class PermissionError(ToolError):
+    pass
+
+
+class RuleFileError(PermissionError):
+    pass
+
+
 class ModelClientError(HammerCodeError):
     pass
 

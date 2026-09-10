@@ -22,6 +22,7 @@ from pydantic import (
 from hammer_code.errors import ConfigurationError, UntrustedEndpointError
 
 ProtocolName = Literal["openai_responses", "openai_chat_completions", "anthropic_messages"]
+BUILTIN_TOOL_NAMES = {"read_file", "edit_file", "create_file", "grep", "glob", "shell"}
 
 
 class BaseModelProfile(BaseModel):
@@ -93,11 +94,24 @@ class UIConfig(BaseModel):
     show_reasoning: bool = False
 
 
+class ToolConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    disabled: tuple[str, ...] = ()
+
+    @field_validator("disabled")
+    @classmethod
+    def _disabled_tools(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value) or any(name not in BUILTIN_TOOL_NAMES for name in value):
+            raise ValueError("disabled tools must be unique built-in tool names")
+        return value
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     default_profile: str
     profiles: dict[str, Profile]
     ui: UIConfig = UIConfig()
+    tools: ToolConfig = ToolConfig()
 
     @model_validator(mode="after")
     def _default_exists(self) -> AppConfig:
