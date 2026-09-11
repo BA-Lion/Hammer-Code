@@ -41,8 +41,8 @@ class ToolExecutor:
                 continue
             seen.add(call.call_id)
             tool = self.registry.get(call.name)
-            if tool is None or not self.registry.enabled(call.name):
-                prepared.append(self._error(call.call_id, "unknown or disabled tool"))
+            if tool is None or not self.registry.exposed(call.name):
+                prepared.append(self._error(call.call_id, "unknown, disabled, or unexposed tool"))
                 continue
             try:
                 arguments = tool.input_model.model_validate(dict(call.arguments))

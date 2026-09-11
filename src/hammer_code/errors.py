@@ -29,6 +29,18 @@ class ToolError(HammerCodeError):
     pass
 
 
+class McpError(ToolError):
+    pass
+
+
+class McpConfigurationError(McpError):
+    pass
+
+
+class McpSchemaError(McpError):
+    pass
+
+
 class PermissionError(ToolError):
     pass
 

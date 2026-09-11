@@ -6,6 +6,7 @@ import asyncio
 from contextlib import suppress
 from uuid import uuid4
 
+from hammer_code.app.context_window import ContextWindow
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import (
     ModelRequest,
@@ -20,6 +21,7 @@ from hammer_code.domain.messages import Message, Role, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import HammerCodeError, StreamInterruptedError
 from hammer_code.llm.client import ModelClient
+from hammer_code.mcp.manager import McpManager
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.ui.console import ConsolePort
@@ -36,6 +38,8 @@ class ChatLoop:
         show_reasoning: bool = False,
         registry: ToolRegistry | None = None,
         executor: ToolExecutor | None = None,
+        context_window: ContextWindow | None = None,
+        mcp_manager: McpManager | None = None,
     ) -> None:
         (
             self.manager,
@@ -46,6 +50,8 @@ class ChatLoop:
             self.show_reasoning,
             self.registry,
             self.executor,
+            self.context_window,
+            self.mcp_manager,
         ) = (
             manager,
             client,
@@ -55,6 +61,8 @@ class ChatLoop:
             show_reasoning,
             registry,
             executor,
+            context_window or ContextWindow(system_prompt),
+            mcp_manager,
         )
         self._exit = False
 
@@ -84,6 +92,8 @@ class ChatLoop:
         elif text == "/clear":
             try:
                 self.manager.clear()
+                if self.registry:
+                    self.registry.clear_discovered()
                 self.ui.info("Conversation cleared.")
             except HammerCodeError as exc:
                 self.ui.error(str(exc))
@@ -107,12 +117,17 @@ class ChatLoop:
                 completed = None
                 announced_calls: set[str] = set()
                 reasoning_status_started = False
+                snapshot = self.context_window.snapshot(
+                    mcp_prompt=self.mcp_manager.prompt if self.mcp_manager else "",
+                    messages=self.manager.snapshot_for_request(turn),
+                    tools=self.registry.definitions() if self.registry else (),
+                )
                 request = ModelRequest(
                     request_id,
                     turn.id,
-                    self.system_prompt,
-                    self.manager.snapshot_for_request(turn),
-                    self.registry.definitions() if self.registry else (),
+                    snapshot.system_prompt,
+                    snapshot.messages,
+                    snapshot.tools,
                     self.max_output_tokens,
                 )
                 self.manager.record_usage(
@@ -159,7 +174,7 @@ class ChatLoop:
                     )
                 call_count += len(calls)
                 unknown_count += sum(
-                    self.registry is None or not self.registry.enabled(call.name) for call in calls
+                    self.registry is None or not self.registry.exposed(call.name) for call in calls
                 )
                 if call_count > 200 or unknown_count > 3 or self.executor is None:
                     self.manager.stage_tool_call(turn, response.message)

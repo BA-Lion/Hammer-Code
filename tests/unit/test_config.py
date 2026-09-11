@@ -62,3 +62,103 @@ def test_endpoint_policy_rejects_remote_http_and_confirms_custom() -> None:
     custom = remote.model_copy(update={"base_url": "https://example.test"})
     with pytest.raises(UntrustedEndpointError):
         EndpointTrustPolicy().validate_and_confirm(custom, lambda _: False)
+
+
+def test_mcp_config_is_strict_and_last_duplicate_keeps_its_final_order() -> None:
+    from hammer_code.config import AppConfig, McpHttpConfig, McpStdioConfig
+
+    config = AppConfig.model_validate(
+        {
+            "default_profile": "main",
+            "profiles": {
+                "main": {
+                    "protocol": "openai_responses",
+                    "model": "model",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_env": "TEST_KEY",
+                    "max_output_tokens": 10,
+                    "timeout_seconds": 5,
+                    "max_retries": 0,
+                }
+            },
+            "mcp": [
+                {
+                    "name": "first",
+                    "description": "first server",
+                    "transport": "stdio",
+                    "command": "python",
+                    "args": ["server.py"],
+                    "env": {"TOKEN": "MCP_TOKEN"},
+                },
+                {
+                    "name": "second",
+                    "description": "second server",
+                    "transport": "streamable_http",
+                    "endpoint": "http://127.0.0.1:8000/mcp",
+                },
+                {
+                    "name": "first",
+                    "description": "replacement",
+                    "transport": "stdio",
+                    "command": "node",
+                },
+            ],
+        }
+    )
+    assert [item.name for item in config.mcp] == ["second", "first"]
+    assert isinstance(config.mcp[0], McpHttpConfig)
+    assert isinstance(config.mcp[1], McpStdioConfig)
+    assert config.mcp[1].command == "node"
+
+
+@pytest.mark.parametrize(
+    "mcp",
+    [
+        {
+            "name": "bad name",
+            "description": "valid",
+            "transport": "stdio",
+            "command": "python",
+        },
+        {
+            "name": "good",
+            "description": "two\nlines",
+            "transport": "stdio",
+            "command": "python",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "streamable_http",
+            "endpoint": "http://example.test/mcp",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "stdio",
+            "command": "python",
+            "env": {"bad-key": "TOKEN"},
+        },
+    ],
+)
+def test_mcp_config_rejects_unsafe_values(mcp: dict[str, object]) -> None:
+    from hammer_code.config import AppConfig
+
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(
+            {
+                "default_profile": "main",
+                "profiles": {
+                    "main": {
+                        "protocol": "openai_responses",
+                        "model": "model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key_env": "TEST_KEY",
+                        "max_output_tokens": 10,
+                        "timeout_seconds": 5,
+                        "max_retries": 0,
+                    }
+                },
+                "mcp": [mcp],
+            }
+        )

@@ -7,6 +7,23 @@ show_reasoning = false
 # Disabled tools only reduce the built-in capability set.
 disabled = []
 
+# MCP servers connect in the background after the CLI starts. The values in `env`
+# map a child-process variable name to the name of a variable already in Hammer
+# Code's environment; do not put secrets in this file.
+[[mcp]]
+name = "example-stdio"
+description = "Example local MCP server"
+transport = "stdio"
+command = "python"
+args = ["path/to/mcp_server.py"]
+# env = { SERVICE_TOKEN = "EXAMPLE_SERVICE_TOKEN" }
+
+[[mcp]]
+name = "example-http"
+description = "Example local Streamable HTTP MCP server"
+transport = "streamable_http"
+endpoint = "http://127.0.0.1:8000/mcp"
+
 [profiles.openai]
 protocol = "openai_responses"
 model = "gpt-5-mini"

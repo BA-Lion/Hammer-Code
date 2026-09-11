@@ -9,10 +9,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hammer_code.app.chat_loop import ChatLoop
+from hammer_code.app.context_window import ContextWindow
 from hammer_code.config import EndpointTrustPolicy, discover_config, load_config, resolve_profile
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.errors import HammerCodeError
 from hammer_code.llm.factory import create_model_client
+from hammer_code.mcp.manager import McpManager
 from hammer_code.permissions.checker import PermissionChecker
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.rules import RuleStore
@@ -26,6 +28,7 @@ from hammer_code.tools.builtin import (
     GrepTool,
     ReadFileTool,
     ShellTool,
+    ToolSearchTool,
 )
 from hammer_code.tools.builtin.shell import sanitized_environment
 from hammer_code.tools.executor import ToolExecutor
@@ -84,6 +87,8 @@ async def _run(args: argparse.Namespace) -> int:
             workspace_root, Path.cwd().resolve(), runtime.session_dir, sanitized_environment()
         )
         executor = ToolExecutor(registry, permissions, context, runtime)
+        mcp_manager = McpManager(config.mcp, registry, workspace_root, ui=ui)
+        registry.register(ToolSearchTool(registry, mcp_manager))
         system_prompt = build_system_prompt(
             PromptRuntimeContext(
                 cwd=Path.cwd().resolve(),
@@ -94,6 +99,7 @@ async def _run(args: argparse.Namespace) -> int:
                 enabled_tools=registry.exposed_names(),
             )
         )
+        context_window = ContextWindow(system_prompt)
         client = create_model_client(resolved)
     except HammerCodeError as exc:
         ui.error(str(exc))
@@ -110,6 +116,7 @@ async def _run(args: argparse.Namespace) -> int:
         urlparse(resolved.profile.base_url).netloc,
     )
     try:
+        mcp_manager.start()
         await ChatLoop(
             manager,
             client,
@@ -119,10 +126,15 @@ async def _run(args: argparse.Namespace) -> int:
             config.ui.show_reasoning,
             registry,
             executor,
+            context_window,
+            mcp_manager,
         ).run()
     finally:
-        await client.aclose()
-        runtime.cleanup()
+        try:
+            await mcp_manager.close()
+        finally:
+            await client.aclose()
+            runtime.cleanup()
     return 0
 
 

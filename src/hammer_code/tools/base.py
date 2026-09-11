@@ -10,6 +10,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from hammer_code.domain.events import ToolDefinition
+
 
 class ToolCategory(StrEnum):
     READ = "read"
@@ -45,8 +47,25 @@ class Tool(ABC):
     input_model: type[BaseModel]
     category: ToolCategory
     concurrency_policy: ConcurrencyPolicy
+    should_defer: bool = False
+
+    def definition(self) -> ToolDefinition:
+        """Project the local Pydantic contract into a model-facing tool definition."""
+        schema = _remove_titles(self.input_model.model_json_schema())
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise ValueError(f"Tool {self.name} must have an object input schema")
+        schema["additionalProperties"] = False
+        return ToolDefinition(self.name, self.description, schema)
 
     @abstractmethod
     async def execute(
         self, context: ToolExecutionContext, arguments: BaseModel
     ) -> ToolExecutionResult: ...
+
+
+def _remove_titles(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _remove_titles(item) for key, item in value.items() if key != "title"}
+    if isinstance(value, list):
+        return [_remove_titles(item) for item in value]
+    return value

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -23,6 +24,10 @@ from hammer_code.errors import ConfigurationError, UntrustedEndpointError
 
 ProtocolName = Literal["openai_responses", "openai_chat_completions", "anthropic_messages"]
 BUILTIN_TOOL_NAMES = {"read_file", "edit_file", "create_file", "grep", "glob", "shell"}
+McpTransport = Literal["stdio", "streamable_http"]
+_MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class BaseModelProfile(BaseModel):
@@ -106,12 +111,102 @@ class ToolConfig(BaseModel):
         return value
 
 
+class McpBaseConfig(BaseModel):
+    """Common, secret-free MCP configuration registered before connection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    name: str
+    description: str
+    transport: str
+    connect_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    tool_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        if not _MCP_NAME.fullmatch(value):
+            raise ValueError("must be 1-64 ASCII letters, digits, dots, underscores, or hyphens")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 1 <= len(normalized) <= 500 or any(char in normalized for char in "\r\n\0"):
+            raise ValueError("must be a non-empty single line of at most 500 characters")
+        return normalized
+
+
+class McpStdioConfig(McpBaseConfig):
+    transport: Literal["stdio"]  # pyright: ignore[reportIncompatibleVariableOverride]
+    command: str
+    args: tuple[str, ...] = ()
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, value: str) -> str:
+        if not value or "\0" in value:
+            raise ValueError("must be non-empty and contain no NUL")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _args(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any("\0" in item for item in value):
+            raise ValueError("arguments must not contain NUL")
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _env(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(
+            not _ENV_NAME.fullmatch(key) or not _ENV_NAME.fullmatch(source)
+            for key, source in value.items()
+        ):
+            raise ValueError("environment names must be valid process variable names")
+        return value
+
+
+class McpHttpConfig(McpBaseConfig):
+    transport: Literal["streamable_http"]  # pyright: ignore[reportIncompatibleVariableOverride]
+    endpoint: str
+
+    @field_validator("endpoint")
+    @classmethod
+    def _endpoint(cls, value: str) -> str:
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("must have a valid port") from exc
+        host = (parsed.hostname or "").casefold()
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or port is not None
+            and not 0 < port <= 65535
+            or parsed.scheme == "http"
+            and host not in _LOOPBACK_HOSTS
+        ):
+            raise ValueError("must be a safe absolute HTTPS URL (HTTP is loopback-only)")
+        return value
+
+
+McpConfig = Annotated[McpStdioConfig | McpHttpConfig, Field(discriminator="transport")]
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     default_profile: str
     profiles: dict[str, Profile]
     ui: UIConfig = UIConfig()
     tools: ToolConfig = ToolConfig()
+    mcp: tuple[McpConfig, ...] = ()
 
     @model_validator(mode="after")
     def _default_exists(self) -> AppConfig:
@@ -119,6 +214,11 @@ class AppConfig(BaseModel):
             raise ValueError("default_profile must name an existing profile")
         if any(not name.strip() for name in self.profiles):
             raise ValueError("profile names must not be blank")
+        final_mcp: dict[str, McpConfig] = {}
+        for item in self.mcp:
+            final_mcp.pop(item.name, None)
+            final_mcp[item.name] = item
+        object.__setattr__(self, "mcp", tuple(final_mcp.values()))
         return self
 
 

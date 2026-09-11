@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from hammer_code.app.chat_loop import ChatLoop
+from hammer_code.app.context_window import ContextWindow
 from hammer_code.config import AppConfig, resolve_profile
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import (
@@ -71,6 +72,9 @@ class FakeUI:
         return ApprovalChoice.DENY
 
     def info(self, message: str) -> None:
+        pass
+
+    def mcp_status(self, name: str, status: str, detail: str | None = None) -> None:
         pass
 
 
@@ -260,3 +264,93 @@ async def test_cancelled_tool_batch_keeps_the_completed_exchange() -> None:
         Role.ASSISTANT,
         Role.USER,
     ]
+
+
+class _DeferredTool(ReadFileTool):
+    name = "deferred"
+    should_defer = True
+
+
+class _McpState:
+    prompt: str
+
+    def __init__(self, prompt: str) -> None:
+        self.prompt = prompt
+
+
+class _PromptChangingExecutor:
+    def __init__(self, registry: ToolRegistry, mcp: _McpState) -> None:
+        self.registry = registry
+        self.mcp = mcp
+
+    async def execute_batch(self, calls: tuple[ToolCallBlock, ...]) -> tuple[ToolResultBlock, ...]:
+        self.registry.discover("deferred")
+        self.mcp.prompt = "# MCP\n\nOverall status: connected\n"
+        return (ToolResultBlock(calls[0].call_id, (TextBlock("found"),), False),)
+
+
+class _TwoRequestClient(ModelClient):
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    @property
+    def capabilities(self) -> ClientCapabilities:
+        return ClientCapabilities("fake", True, False, False, True)
+
+    async def aclose(self) -> None:
+        pass
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        self.requests.append(request)
+        yield ResponseStarted(request.request_id, "provider", "model")
+        if len(self.requests) == 1:
+            call = ToolCallBlock("search", "toolSearch", {"query": "find"}, '{"query":"find"}')
+            yield ToolCallCompleted(request.request_id, 0, call)
+            yield ResponseCompleted(
+                request.request_id,
+                ModelResponse(
+                    "provider",
+                    "model",
+                    Message(Role.ASSISTANT, (call,)),
+                    StopReason.TOOL_CALL,
+                    TokenUsage(1, 1, status=UsageStatus.FINAL),
+                ),
+            )
+            return
+        yield ResponseCompleted(
+            request.request_id,
+            ModelResponse(
+                "provider",
+                "model",
+                Message(Role.ASSISTANT, (TextBlock("done"),)),
+                StopReason.END_TURN,
+                TokenUsage(1, 1, status=UsageStatus.FINAL),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_next_request_uses_new_context_snapshot_after_tool_execution() -> None:
+    manager = _manager()
+    registry = ToolRegistry()
+    registry.register(ReadFileTool())
+    registry.register(_DeferredTool())
+    client = _TwoRequestClient()
+    mcp = _McpState("# MCP\n\nOverall status: connecting\n")
+    loop = ChatLoop(
+        manager,
+        client,
+        FakeUI(),
+        "base",
+        5,
+        registry=registry,
+        executor=_PromptChangingExecutor(registry, mcp),  # type: ignore[arg-type]
+        context_window=ContextWindow("base"),
+        mcp_manager=mcp,  # type: ignore[arg-type]
+    )
+    await loop.run_turn("find")
+    assert "connecting" in client.requests[0].system_prompt
+    assert "connected" in client.requests[1].system_prompt
+    assert "connecting" in client.requests[0].system_prompt
+    assert "deferred" not in {tool.name for tool in client.requests[0].tools}
+    assert "deferred" in {tool.name for tool in client.requests[1].tools}
