@@ -17,6 +17,14 @@ from hammer_code.tools.results import bound_result
 from hammer_code.tools.runtime import RuntimeStore
 
 
+class ToolBatchCancelled(asyncio.CancelledError):
+    """Cancellation carrying a result for every call that was not executed."""
+
+    def __init__(self, results: tuple[ToolResultBlock, ...]) -> None:
+        super().__init__("Tool execution was cancelled")
+        self.results = results
+
+
 @dataclass(frozen=True)
 class ToolExecutor:
     registry: ToolRegistry
@@ -60,37 +68,49 @@ class ToolExecutor:
                 prepared.append(self._error(call.call_id, str(exc)))
         results: list[ToolResultBlock | None] = [None] * len(prepared)
         index = 0
-        while index < len(prepared):
-            item = prepared[index]
-            if isinstance(item, ToolResultBlock):
-                results[index] = item
-                index += 1
-                continue
-            call, arguments, _ = item
-            tool = self.registry.get(call.name)
-            assert tool is not None
-            if tool.concurrency_policy is ConcurrencyPolicy.SERIAL:
-                results[index] = await self._run(call, arguments)
-                index += 1
-                continue
-            end = index
-            parallel: list[tuple[ToolCallBlock, BaseModel, PermissionRequest]] = []
-            while end < len(prepared) and not isinstance(prepared[end], ToolResultBlock):
-                candidate = prepared[end]
-                assert not isinstance(candidate, ToolResultBlock)
-                candidate_tool = self.registry.get(candidate[0].name)
-                assert candidate_tool is not None
-                if candidate_tool.concurrency_policy is ConcurrencyPolicy.SERIAL:
-                    break
-                parallel.append(candidate)
-                end += 1
-            for position, result in zip(
-                range(index, end),
-                await asyncio.gather(*(self._run(item[0], item[1]) for item in parallel)),
-                strict=True,
-            ):
-                results[position] = result
-            index = end
+        try:
+            while index < len(prepared):
+                item = prepared[index]
+                if isinstance(item, ToolResultBlock):
+                    results[index] = item
+                    index += 1
+                    continue
+                call, arguments, _ = item
+                tool = self.registry.get(call.name)
+                assert tool is not None
+                if tool.concurrency_policy is ConcurrencyPolicy.SERIAL:
+                    results[index] = await self._run(call, arguments)
+                    index += 1
+                    continue
+                end = index
+                parallel: list[tuple[ToolCallBlock, BaseModel, PermissionRequest]] = []
+                while end < len(prepared) and not isinstance(prepared[end], ToolResultBlock):
+                    candidate = prepared[end]
+                    assert not isinstance(candidate, ToolResultBlock)
+                    candidate_tool = self.registry.get(candidate[0].name)
+                    assert candidate_tool is not None
+                    if candidate_tool.concurrency_policy is ConcurrencyPolicy.SERIAL:
+                        break
+                    parallel.append(candidate)
+                    end += 1
+                for position, result in zip(
+                    range(index, end),
+                    await asyncio.gather(*(self._run(item[0], item[1]) for item in parallel)),
+                    strict=True,
+                ):
+                    results[position] = result
+                index = end
+        except asyncio.CancelledError as exc:
+            cancelled = tuple(
+                result
+                if result is not None
+                else self._error(
+                    item[0].call_id if isinstance(item, tuple) else item.call_id,
+                    "tool call cancelled before completion",
+                )
+                for item, result in zip(prepared, results, strict=True)
+            )
+            raise ToolBatchCancelled(cancelled) from exc
         return tuple(result for result in results if result is not None)
 
     def _paths_for(self, name: str, arguments: BaseModel) -> tuple:

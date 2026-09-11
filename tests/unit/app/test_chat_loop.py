@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -14,13 +15,24 @@ from hammer_code.domain.events import (
     ResponseStarted,
     StopReason,
     TextDelta,
+    ToolCallCompleted,
     UsageUpdated,
 )
-from hammer_code.domain.messages import Message, ReasoningVisibility, Role, TextBlock
+from hammer_code.domain.messages import (
+    Message,
+    ReasoningVisibility,
+    Role,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+)
 from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import TransportError
 from hammer_code.llm.client import ClientCapabilities, ModelClient
 from hammer_code.permissions.models import ApprovalChoice
+from hammer_code.tools.builtin.files import ReadFileTool
+from hammer_code.tools.executor import ToolBatchCancelled
+from hammer_code.tools.registry import ToolRegistry
 
 
 class FakeUI:
@@ -98,6 +110,37 @@ class FakeClient(ModelClient):
             TokenUsage(1, 2, status=UsageStatus.FINAL),
         )
         yield ResponseCompleted(request.request_id, response)
+
+
+class ToolCallClient(ModelClient):
+    @property
+    def capabilities(self) -> ClientCapabilities:
+        return ClientCapabilities("fake", True, False, False, True)
+
+    async def aclose(self) -> None:
+        pass
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        call = ToolCallBlock("call", "read_file", {"path": "a.txt"}, '{"path":"a.txt"}')
+        yield ResponseStarted(request.request_id, "provider", "model")
+        yield ToolCallCompleted(request.request_id, 0, call)
+        yield ResponseCompleted(
+            request.request_id,
+            ModelResponse(
+                "provider",
+                "model",
+                Message(Role.ASSISTANT, (call,)),
+                StopReason.TOOL_CALL,
+                TokenUsage(1, 1, status=UsageStatus.FINAL),
+            ),
+        )
+
+
+class CancelledExecutor:
+    async def execute_batch(self, calls: tuple[ToolCallBlock, ...]) -> tuple[ToolResultBlock, ...]:
+        raise ToolBatchCancelled(
+            (ToolResultBlock(calls[0].call_id, (TextBlock("cancelled"),), True),)
+        )
 
 
 def _manager() -> ConversationManager:
@@ -192,3 +235,28 @@ async def test_chat_loop_recovers_after_failure_before_first_event() -> None:
     loop.client = FakeClient()
     await loop.run_turn("hello again")
     assert manager.conversation.messages and len(manager.conversation.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_batch_keeps_the_completed_exchange() -> None:
+    manager = _manager()
+    registry = ToolRegistry()
+    registry.register(ReadFileTool())
+    loop = ChatLoop(
+        manager,
+        ToolCallClient(),
+        FakeUI(),
+        "system",
+        5,
+        registry=registry,
+        executor=CancelledExecutor(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run_turn("inspect")
+    assert manager.conversation is not None
+    assert [message.role for message in manager.conversation.messages] == [
+        Role.USER,
+        Role.ASSISTANT,
+        Role.USER,
+    ]

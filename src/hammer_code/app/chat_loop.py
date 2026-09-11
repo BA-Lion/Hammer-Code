@@ -20,7 +20,7 @@ from hammer_code.domain.messages import Message, Role, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import HammerCodeError, StreamInterruptedError
 from hammer_code.llm.client import ModelClient
-from hammer_code.tools.executor import ToolExecutor
+from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.ui.console import ConsolePort
 
@@ -171,6 +171,10 @@ class ChatLoop:
                 self.manager.stage_tool_results(turn, Message(Role.USER, tuple(results)))
             self.ui.error("Tool loop request limit reached")
             self.manager.interrupt(turn)
+        except ToolBatchCancelled as exc:
+            self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
+            self.manager.interrupt(turn)
+            raise asyncio.CancelledError from exc
         except asyncio.CancelledError:
             self.manager.interrupt(turn)
             raise
