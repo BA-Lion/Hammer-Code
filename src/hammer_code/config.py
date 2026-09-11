@@ -172,6 +172,14 @@ class McpStdioConfig(McpBaseConfig):
 class McpHttpConfig(McpBaseConfig):
     transport: Literal["streamable_http"]  # pyright: ignore[reportIncompatibleVariableOverride]
     endpoint: str
+    bearer_token_env: str | None = None
+
+    @field_validator("bearer_token_env")
+    @classmethod
+    def _bearer_token_env(cls, value: str | None) -> str | None:
+        if value is not None and not _ENV_NAME.fullmatch(value):
+            raise ValueError("must be a valid process variable name")
+        return value
 
     @field_validator("endpoint")
     @classmethod

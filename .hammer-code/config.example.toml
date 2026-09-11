@@ -20,9 +20,11 @@ args = ["path/to/mcp_server.py"]
 
 [[mcp]]
 name = "example-http"
-description = "Example local Streamable HTTP MCP server"
+description = "Example authenticated remote Streamable HTTP MCP server"
 transport = "streamable_http"
-endpoint = "http://127.0.0.1:8000/mcp"
+endpoint = "https://mcp.example.test/mcp"
+# This is an environment variable name, not a token value. Do not use `env` for HTTP MCP.
+bearer_token_env = "EXAMPLE_MCP_TOKEN"
 
 [profiles.openai]
 protocol = "openai_responses"

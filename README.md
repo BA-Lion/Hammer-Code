@@ -36,6 +36,23 @@ python -m uv run hammer-code --config .hammer-code/config.toml --profile openai
 
 在配置中用 `[[mcp]]` 登记 MCP Server。`stdio` Server 只得到 SDK 的安全默认环境和 `env` 中显式映射的变量；`env` 的值是当前进程环境变量名，而不是密钥。`streamable_http` 的远程 endpoint 必须使用 HTTPS；`localhost`、`127.0.0.1` 和 `::1` 可使用 HTTP。示例见 `.hammer-code/config.example.toml`。
 
+需要标准 Bearer 认证的 Streamable HTTP MCP 使用扁平的 `bearer_token_env` 字段。该字段保存的是当前进程的环境变量名，连接时才会读取其值并发送 `Authorization: Bearer`；不要把 token 写入 TOML、URL 或 `env` 映射。PowerShell 示例：
+
+```powershell
+$env:EXAMPLE_MCP_TOKEN = "…"
+```
+
+```toml
+[[mcp]]
+name = "example-http"
+description = "Example authenticated MCP"
+transport = "streamable_http"
+endpoint = "https://mcp.example.test/mcp"
+bearer_token_env = "EXAMPLE_MCP_TOKEN"
+```
+
+`env = { bearer_token_env_var = "EXAMPLE_MCP_TOKEN" }` 不是 HTTP MCP 的有效配置，必须迁移为上面的 `bearer_token_env`。目前不支持任意 headers、OAuth、Basic、mTLS、proxy、cookie 或 token 持久化。
+
 MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不会阻塞其他 Server。配置名称、描述和加载状态会进入下一次模型请求的 MCP 提示片段；MCP 工具默认不进入模型工具列表。模型应先调用始终公开的 `toolSearch`，其找到的最多五个工具会从下一次 Agent Loop 请求开始以完整 schema 公开。未发现的工具即使名称被猜中也不能执行；`/clear` 会清除本次会话的发现状态。
 
 ## 交互

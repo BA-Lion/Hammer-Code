@@ -6,12 +6,15 @@ import asyncio
 import base64
 import json
 import os
+import re
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
+import httpx2
 from mcp import Client, StdioServerParameters
+from mcp.client.streamable_http import streamable_http_client
 from mcp.types import (
     AudioContent,
     EmbeddedResource,
@@ -27,6 +30,9 @@ from hammer_code.mcp.types import McpCallResult, McpClientStatus
 from hammer_code.mcp.wrapper import McpToolWrapper
 
 ClientFactory = Callable[[Any], Any]
+HttpClientFactory = Callable[..., Any]
+HttpTransportFactory = Callable[..., Any]
+_BEARER_TOKEN = re.compile(r"\A[A-Za-z0-9._~+/-]+=*\Z")
 
 
 class McpClient:
@@ -37,11 +43,16 @@ class McpClient:
         config: McpConfig,
         workspace_root: Path,
         client_factory: ClientFactory = Client,
+        *,
+        http_client_factory: HttpClientFactory = httpx2.AsyncClient,
+        http_transport_factory: HttpTransportFactory = streamable_http_client,
     ) -> None:
         self.config = config
         self.name = config.name
         self._workspace_root = workspace_root.resolve()
         self._client_factory = client_factory
+        self._http_client_factory = http_client_factory
+        self._http_transport_factory = http_transport_factory
         self.sdk_client: Any | None = None
         self.clientsession: Any | None = None
         self.stack: AsyncExitStack | None = None
@@ -124,7 +135,18 @@ class McpClient:
                     cwd=self._cwd(),
                 )
             else:
-                target = self.config.endpoint
+                if self.config.bearer_token_env is None:
+                    target = self.config.endpoint
+                else:
+                    http_client = self._http_client_factory(
+                        headers=self._bearer_headers(),
+                        timeout=httpx2.Timeout(30.0, read=300.0),
+                    )
+                    entered_http_client = await stack.enter_async_context(http_client)
+                    target = self._http_transport_factory(
+                        self.config.endpoint,
+                        http_client=entered_http_client,
+                    )
             client = self._client_factory(target)
             entered = await stack.enter_async_context(client)
             self.stack = stack
@@ -165,6 +187,21 @@ class McpClient:
                     "MCP configured environment variable is unavailable"
                 ) from exc
         return environment
+
+    def _bearer_headers(self) -> dict[str, str]:
+        assert isinstance(self.config, McpHttpConfig)
+        assert self.config.bearer_token_env is not None
+        token = os.environ.get(self.config.bearer_token_env)
+        if (
+            token is None
+            or token != token.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in token)
+            or not _BEARER_TOKEN.fullmatch(token)
+        ):
+            raise McpConfigurationError(
+                "MCP bearer token environment variable is unavailable or invalid"
+            )
+        return {"Authorization": f"Bearer {token}"}
 
     def _cwd(self) -> Path:
         assert isinstance(self.config, McpStdioConfig)

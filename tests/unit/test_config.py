@@ -107,6 +107,7 @@ def test_mcp_config_is_strict_and_last_duplicate_keeps_its_final_order() -> None
     )
     assert [item.name for item in config.mcp] == ["second", "first"]
     assert isinstance(config.mcp[0], McpHttpConfig)
+    assert config.mcp[0].bearer_token_env is None
     assert isinstance(config.mcp[1], McpStdioConfig)
     assert config.mcp[1].command == "node"
 
@@ -131,6 +132,34 @@ def test_mcp_config_is_strict_and_last_duplicate_keeps_its_final_order() -> None
             "description": "valid",
             "transport": "streamable_http",
             "endpoint": "http://example.test/mcp",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "streamable_http",
+            "endpoint": "https://example.test/mcp",
+            "bearer_token_env": "invalid-name",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "streamable_http",
+            "endpoint": "https://example.test/mcp",
+            "bearer_token_env": " ",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "streamable_http",
+            "endpoint": "https://example.test/mcp",
+            "bearer_token": "plaintext-is-not-allowed",
+        },
+        {
+            "name": "good",
+            "description": "valid",
+            "transport": "streamable_http",
+            "endpoint": "https://example.test/mcp",
+            "env": {"TOKEN": "SOURCE_TOKEN"},
         },
         {
             "name": "good",
@@ -162,3 +191,16 @@ def test_mcp_config_rejects_unsafe_values(mcp: dict[str, object]) -> None:
                 "mcp": [mcp],
             }
         )
+
+
+def test_mcp_http_bearer_environment_reference_is_retained_without_resolving() -> None:
+    from hammer_code.config import McpHttpConfig
+
+    config = McpHttpConfig(
+        name="authenticated",
+        description="Authenticated MCP",
+        transport="streamable_http",
+        endpoint="https://example.test/mcp",
+        bearer_token_env="EXAMPLE_MCP_TOKEN",
+    )
+    assert config.bearer_token_env == "EXAMPLE_MCP_TOKEN"
