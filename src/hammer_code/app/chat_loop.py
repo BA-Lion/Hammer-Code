@@ -6,6 +6,7 @@ import asyncio
 from contextlib import suppress
 from uuid import uuid4
 
+from hammer_code.app.context_manager import ContextManager
 from hammer_code.app.context_window import ContextWindow
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import (
@@ -17,9 +18,9 @@ from hammer_code.domain.events import (
     ToolCallCompleted,
     UsageUpdated,
 )
-from hammer_code.domain.messages import Message, Role, ToolCallBlock
+from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus
-from hammer_code.errors import HammerCodeError, StreamInterruptedError
+from hammer_code.errors import ContextCompactionError, HammerCodeError, StreamInterruptedError
 from hammer_code.llm.client import ModelClient
 from hammer_code.mcp.manager import McpManager
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
@@ -40,6 +41,7 @@ class ChatLoop:
         executor: ToolExecutor | None = None,
         context_window: ContextWindow | None = None,
         mcp_manager: McpManager | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         (
             self.manager,
@@ -52,6 +54,7 @@ class ChatLoop:
             self.executor,
             self.context_window,
             self.mcp_manager,
+            self.context_manager,
         ) = (
             manager,
             client,
@@ -63,6 +66,7 @@ class ChatLoop:
             executor,
             context_window or ContextWindow(system_prompt),
             mcp_manager,
+            context_manager,
         )
         self._exit = False
 
@@ -75,7 +79,7 @@ class ChatLoop:
             if not text.strip():
                 continue
             if text.startswith("/"):
-                self._command(text)
+                await self._command(text)
             else:
                 task = asyncio.create_task(self.run_turn(text))
                 try:
@@ -86,15 +90,22 @@ class ChatLoop:
                         await task
                     self.ui.error("Request cancelled.")
 
-    def _command(self, text: str) -> None:
+    async def _command(self, text: str) -> None:
         if text == "/help":
             self.ui.help()
         elif text == "/clear":
             try:
                 self.manager.clear()
+                cleanup_ok = self.context_manager.clear() if self.context_manager else True
                 if self.registry:
                     self.registry.clear_discovered()
-                self.ui.info("Conversation cleared.")
+                if cleanup_ok:
+                    self.ui.info("Conversation cleared.")
+                else:
+                    self.ui.error(
+                        "Conversation cleared, but some temporary tool "
+                        "results could not be removed."
+                    )
             except HammerCodeError as exc:
                 self.ui.error(str(exc))
         elif text == "/usage":
@@ -102,25 +113,62 @@ class ChatLoop:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_conversation())
         elif text == "/exit":
             self._exit = True
+        elif text == "/compact":
+            if self.context_manager is None:
+                self.ui.error("Context compaction is unavailable.")
+                return
+            try:
+                prompt, tools = self._sample_context()
+                preparation = await self.context_manager.compact_now(mcp_prompt=prompt, tools=tools)
+                if preparation.compact_event is None:
+                    self.ui.info("Nothing to compact.")
+                else:
+                    self.ui.compact(preparation.compact_event)
+                    if preparation.cleanup_failed:
+                        self.ui.error(
+                            "Context compacted, but some temporary tool "
+                            "results could not be removed."
+                        )
+            except ContextCompactionError as exc:
+                self.ui.error(str(exc))
         else:
             self.ui.error("Unknown command. Use /help.")
 
     async def run_turn(self, text: str) -> None:
-        turn = self.manager.begin_turn(text)
+        turn = None
         request_count = 0
         call_count = 0
         unknown_count = 0
         try:
+            if self.context_manager is not None:
+                pending = Message(Role.USER, (TextBlock(text),))
+                prompt, tools = self._sample_context()
+                preparation = await self.context_manager.prepare_before_request(
+                    current_suffix=(pending,), mcp_prompt=prompt, tools=tools
+                )
+                self._show_preparation(preparation)
+            turn = self.manager.begin_turn(text)
             while request_count < 50:
                 request_count += 1
                 request_id = str(uuid4())
                 completed = None
                 announced_calls: set[str] = set()
                 reasoning_status_started = False
+                prompt, tools = self._sample_context()
+                if self.context_manager is not None and request_count > 1:
+                    preparation = await self.context_manager.prepare_before_request(
+                        current_suffix=self.manager.snapshot_staged(turn),
+                        mcp_prompt=prompt,
+                        tools=tools,
+                    )
+                    self._show_preparation(preparation)
                 snapshot = self.context_window.snapshot(
-                    mcp_prompt=self.mcp_manager.prompt if self.mcp_manager else "",
+                    mcp_prompt=prompt,
+                    recovery_prompt=self.context_manager.recovery_prompt
+                    if self.context_manager
+                    else "",
                     messages=self.manager.snapshot_for_request(turn),
-                    tools=self.registry.definitions() if self.registry else (),
+                    tools=tools,
                 )
                 request = ModelRequest(
                     request_id,
@@ -187,17 +235,35 @@ class ChatLoop:
             self.ui.error("Tool loop request limit reached")
             self.manager.interrupt(turn)
         except ToolBatchCancelled as exc:
-            self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
-            self.manager.interrupt(turn)
+            if turn is not None:
+                self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
+                self.manager.interrupt(turn)
             raise asyncio.CancelledError from exc
         except asyncio.CancelledError:
-            self.manager.interrupt(turn)
+            if turn is not None:
+                self.manager.interrupt(turn)
             raise
         except Exception as exc:
-            self.manager.interrupt(turn)
+            if turn is not None:
+                self.manager.interrupt(turn)
             self.ui.error(
                 str(exc) if isinstance(exc, HammerCodeError) else "Unexpected model failure"
             )
         finally:
-            if self.manager.conversation:
+            if self.manager.conversation and turn is not None:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_turn(turn.id))
+
+    def _sample_context(self) -> tuple[str, tuple]:
+        return (
+            self.mcp_manager.prompt if self.mcp_manager else "",
+            self.registry.definitions() if self.registry else (),
+        )
+
+    def _show_preparation(self, preparation: object) -> None:
+        event = getattr(preparation, "compact_event", None)
+        if event is not None:
+            self.ui.compact(event)
+        if getattr(preparation, "cleanup_failed", False):
+            self.ui.error(
+                "Context compacted, but some temporary tool results could not be removed."
+            )

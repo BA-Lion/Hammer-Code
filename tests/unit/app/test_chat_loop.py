@@ -77,6 +77,9 @@ class FakeUI:
     def mcp_status(self, name: str, status: str, detail: str | None = None) -> None:
         pass
 
+    def compact(self, event) -> None:
+        pass
+
 
 class FakeClient(ModelClient):
     def __init__(

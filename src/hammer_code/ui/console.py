@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.status import Status
 from rich.text import Text
 
+from hammer_code.domain.events import CompactEvent
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import UsageSummary
 from hammer_code.permissions.models import ApprovalChoice, PermissionRequest
@@ -26,6 +27,7 @@ class ConsolePort(Protocol):
     def mcp_status(self, name: str, status: str, detail: str | None = None) -> None: ...
     def usage(self, summary: UsageSummary) -> None: ...
     def help(self) -> None: ...
+    def compact(self, event: CompactEvent) -> None: ...
     async def approve(self, request: PermissionRequest, reason: str) -> ApprovalChoice: ...
 
 
@@ -179,4 +181,11 @@ class ConsoleUI:
 
     def help(self) -> None:
         self._begin_block()
-        self.console.print("Local commands: /help, /clear, /usage, /exit")
+        self.console.print("Local commands: /help, /clear, /compact, /usage, /exit")
+
+    def compact(self, event: CompactEvent) -> None:
+        self._begin_block()
+        self.console.print(
+            f"Compacted context: ~{event.before_tokens} → ~{event.after_tokens} tokens; "
+            f"saved ~{event.saved_tokens}"
+        )

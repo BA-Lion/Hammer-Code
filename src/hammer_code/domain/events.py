@@ -27,6 +27,17 @@ class ToolDefinition:
 
 
 @dataclass(frozen=True)
+class CompactEvent:
+    before_tokens: int
+    after_tokens: int
+    saved_tokens: int
+
+    def __post_init__(self) -> None:
+        if min(self.before_tokens, self.after_tokens, self.saved_tokens) < 0:
+            raise ValueError("Context estimates cannot be negative")
+
+
+@dataclass(frozen=True)
 class ModelRequest:
     request_id: str
     turn_id: str

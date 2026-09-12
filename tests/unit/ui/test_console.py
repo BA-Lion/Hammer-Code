@@ -2,6 +2,7 @@ from io import StringIO
 
 from rich.console import Console
 
+from hammer_code.domain.events import CompactEvent
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus, UsageSummary
 from hammer_code.ui.console import ConsoleUI
@@ -98,3 +99,10 @@ def test_console_flushes_a_coalesced_stream_after_reaching_terminal_width() -> N
         ui.text_delta(chunk)
 
     assert output.getvalue() == "".join(chunks)
+
+
+def test_console_displays_context_estimates_as_a_compaction_block() -> None:
+    output = StringIO()
+    ui = ConsoleUI(Console(file=output, force_terminal=False))
+    ui.compact(CompactEvent(100, 20, 80))
+    assert "Compacted context: ~100 → ~20 tokens; saved ~80" in output.getvalue()

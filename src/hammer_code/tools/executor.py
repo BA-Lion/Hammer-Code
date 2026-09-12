@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
 
+from hammer_code.app.token_estimator import TokenEstimator
+from hammer_code.config import ContextConfig
 from hammer_code.domain.messages import TextBlock, ToolCallBlock, ToolResultBlock
 from hammer_code.permissions.models import PermissionRequest
 from hammer_code.permissions.paths import PathPolicy
 from hammer_code.permissions.service import PermissionService
 from hammer_code.tools.base import ConcurrencyPolicy, ToolExecutionContext
 from hammer_code.tools.registry import ToolRegistry
-from hammer_code.tools.results import bound_result
+from hammer_code.tools.results import bound_tool_results
 from hammer_code.tools.runtime import RuntimeStore
 
 
@@ -25,12 +28,18 @@ class ToolBatchCancelled(asyncio.CancelledError):
         self.results = results
 
 
+ToolResultObserver = Callable[[ToolCallBlock, BaseModel, object], None]
+
+
 @dataclass(frozen=True)
 class ToolExecutor:
     registry: ToolRegistry
     permissions: PermissionService
     context: ToolExecutionContext
     runtime: RuntimeStore
+    context_config: ContextConfig = ContextConfig()
+    estimator: TokenEstimator = TokenEstimator()
+    observer: ToolResultObserver | None = None
 
     async def execute_batch(self, calls: tuple[ToolCallBlock, ...]) -> tuple[ToolResultBlock, ...]:
         prepared: list[tuple[ToolCallBlock, BaseModel, PermissionRequest] | ToolResultBlock] = []
@@ -111,7 +120,8 @@ class ToolExecutor:
                 for item, result in zip(prepared, results, strict=True)
             )
             raise ToolBatchCancelled(cancelled) from exc
-        return tuple(result for result in results if result is not None)
+        final = tuple(result for result in results if result is not None)
+        return bound_tool_results(final, self.runtime, self.context_config, self.estimator)
 
     def _paths_for(self, name: str, arguments: BaseModel) -> tuple:
         if name in {"read_file", "edit_file", "create_file", "grep", "glob"}:
@@ -124,9 +134,10 @@ class ToolExecutor:
         assert tool is not None
         try:
             raw = await tool.execute(self.context, arguments)
-            bounded = bound_result(raw.content, call.call_id, self.runtime)
+            if self.observer is not None:
+                self.observer(call, arguments, raw)
             return ToolResultBlock(
-                call.call_id, (TextBlock(bounded.content or "(empty output)"),), raw.is_error
+                call.call_id, (TextBlock(raw.content or "(empty output)"),), raw.is_error
             )
         except asyncio.CancelledError:
             raise

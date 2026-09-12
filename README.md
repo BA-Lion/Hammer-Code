@@ -57,7 +57,15 @@ MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不�
 
 ## 交互
 
-启动后支持本地命令：`/help`、`/clear`、`/usage` 和 `/exit`。`/clear` 只清除内存中的历史和 usage；对话不会写入磁盘。生成期间取消会回滚该轮消息，但会保留已经收到的 usage 快照。
+启动后支持本地命令：`/help`、`/clear`、`/compact`、`/usage` 和 `/exit`。`/compact`
+只能在轮次之间执行：它复用自动压缩的管线，但不受自动阈值限制，成功后只展示估算
+节省量，不会发起普通模型请求。没有可压缩历史时会提示 `Nothing to compact.`。
+
+上下文预算是本地 UTF-8 字节估算，不是供应商 usage。每次普通模型请求前都会检查预算；
+达到触发点时，系统只摘要已提交历史，当前 user 输入及当前工具轮次始终原样保留在最终请求尾部。
+摘要失败最多重试三次，之后保留会话并安全报错，不会自动清空历史。超大工具结果的临时
+捕获位于 `.hammer-code/tmp/<session-id>/tool-results/`，可在成功摘要后定向清理；`/clear`
+会同时清除内存历史、usage、MCP 已发现工具、恢复线索和当前会话临时结果。
 
 ```powershell
 python -m uv run python -m hammer_code --help
@@ -80,4 +88,4 @@ python -m uv build
 
 已实现：统一消息/事件模型、内存会话事务、按 request 快照的 Token usage、严格配置与 endpoint 信任检查、三协议独立流式适配器、受权限控制的本地工具、MCP stdio/Streamable HTTP Client、延迟工具发现与不可变 ContextWindow，以及 Rich CLI。
 
-未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、上下文压缩、Memory、Skill、Subagent 和持久化会话。
+未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、Memory、Skill、Subagent 和持久化会话。

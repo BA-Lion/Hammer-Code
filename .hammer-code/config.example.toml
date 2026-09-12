@@ -7,6 +7,19 @@ show_reasoning = false
 # Disabled tools only reduce the built-in capability set.
 disabled = []
 
+# Local context-budget estimates, not provider-reported token usage.
+[context]
+tool_result_overflow_tokens = 5000
+tool_result_preview_tokens = 2000
+tool_batch_tokens = 20000
+stale_after_turns = 10
+stale_tool_result_tokens = 200
+max_context_tokens = 300000
+compact_trigger_tokens = 270000
+summary_target_tokens = 30000
+recovery_file_count = 5
+recovery_file_tokens = 5000
+
 # MCP servers connect in the background after the CLI starts. The values in `env`
 # map a child-process variable name to the name of a variable already in Hammer
 # Code's environment; do not put secrets in this file.

@@ -111,6 +111,36 @@ class ToolConfig(BaseModel):
         return value
 
 
+class ContextConfig(BaseModel):
+    """Local, deliberately approximate context-budget controls."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    tool_result_overflow_tokens: int = Field(default=5000, gt=0)
+    tool_result_preview_tokens: int = Field(default=2000, gt=0)
+    tool_batch_tokens: int = Field(default=20000, gt=0)
+    stale_after_turns: int = Field(default=10, gt=0)
+    stale_tool_result_tokens: int = Field(default=200, gt=0)
+    max_context_tokens: int = Field(default=300000, gt=0)
+    compact_trigger_tokens: int = Field(default=270000, gt=0)
+    summary_target_tokens: int = Field(default=30000, gt=0)
+    recovery_file_count: int = Field(default=5, gt=0)
+    recovery_file_tokens: int = Field(default=5000, gt=0)
+
+    @model_validator(mode="after")
+    def _relationships(self) -> ContextConfig:
+        if not (
+            self.stale_tool_result_tokens
+            <= self.tool_result_preview_tokens
+            <= self.tool_result_overflow_tokens
+        ):
+            raise ValueError("tool result preview budgets must be ordered")
+        if self.tool_result_preview_tokens > self.tool_batch_tokens:
+            raise ValueError("tool result preview must fit the batch budget")
+        if not self.summary_target_tokens < self.compact_trigger_tokens < self.max_context_tokens:
+            raise ValueError("summary target, trigger, and maximum context budgets must be ordered")
+        return self
+
+
 class McpBaseConfig(BaseModel):
     """Common, secret-free MCP configuration registered before connection."""
 
@@ -214,6 +244,7 @@ class AppConfig(BaseModel):
     profiles: dict[str, Profile]
     ui: UIConfig = UIConfig()
     tools: ToolConfig = ToolConfig()
+    context: ContextConfig = ContextConfig()
     mcp: tuple[McpConfig, ...] = ()
 
     @model_validator(mode="after")

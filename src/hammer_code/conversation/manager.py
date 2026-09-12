@@ -66,6 +66,33 @@ class ConversationManager:
         assert self.conversation is not None
         return tuple(self.conversation.messages) + tuple(turn.staged_messages)
 
+    def snapshot_committed(self) -> tuple[Message, ...]:
+        if self.conversation is None:
+            raise ConversationError("Create a conversation before reading its history")
+        return tuple(self.conversation.messages)
+
+    def snapshot_staged(self, turn: TurnTransaction) -> tuple[Message, ...]:
+        self._assert_active(turn)
+        return tuple(turn.staged_messages)
+
+    def replace_committed_history(
+        self, expected: tuple[Message, ...], replacement: tuple[Message, ...]
+    ) -> None:
+        if self.conversation is None:
+            raise ConversationError("Create a conversation before replacing its history")
+        if tuple(self.conversation.messages) != expected:
+            raise ConversationBusyError("Conversation history changed during context compaction")
+        if any(not isinstance(message, Message) or not message.content for message in replacement):
+            raise ConversationError("Replacement history must contain non-empty messages")
+        self.conversation.messages[:] = replacement
+
+    def record_maintenance_usage(
+        self, operation_id: str, request_id: str, usage: TokenUsage
+    ) -> None:
+        if self.conversation is None:
+            raise ConversationError("Create a conversation before recording usage")
+        self.conversation.usage_ledger.upsert(request_id, operation_id, usage)
+
     def record_usage(self, turn: TurnTransaction, request_id: str, usage: TokenUsage) -> None:
         self._assert_active(turn)
         assert self.conversation is not None

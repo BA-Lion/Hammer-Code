@@ -11,4 +11,5 @@ build/
 *.egg-info/
 .hammer-code/config.toml
 .hammer-code/runtime/
+.hammer-code/tmp/
 Trial/

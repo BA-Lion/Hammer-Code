@@ -21,6 +21,18 @@ class ConversationBusyError(ConversationError):
     pass
 
 
+class ContextCompactionError(HammerCodeError):
+    """A safe failure that leaves the in-memory conversation unchanged."""
+
+    def __init__(self, reason: str = "an unspecified compaction validation failed") -> None:
+        normalized = reason.strip().rstrip(".") or "an unspecified compaction validation failed"
+        self.reason = normalized
+        super().__init__(
+            f"Context compaction failed: {normalized}. "
+            "The conversation was preserved. Use /clear if needed."
+        )
+
+
 class InvalidTurnStateError(ConversationError):
     pass
 

@@ -9,7 +9,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hammer_code.app.chat_loop import ChatLoop
+from hammer_code.app.context_manager import ContextManager, RecoveryState
 from hammer_code.app.context_window import ContextWindow
+from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.config import EndpointTrustPolicy, discover_config, load_config, resolve_profile
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.errors import HammerCodeError
@@ -71,6 +73,10 @@ async def _run(args: argparse.Namespace) -> int:
         workspace_root = path.parent.parent.resolve()
         runtime = RuntimeStore(workspace_root)
         runtime.cleanup_old()
+        estimator = TokenEstimator()
+        recovery = RecoveryState(config.context)
+        manager = ConversationManager()
+        manager.create(resolved)
         registry = ToolRegistry(config.tools.disabled)
         for tool in (
             ReadFileTool(),
@@ -86,7 +92,6 @@ async def _run(args: argparse.Namespace) -> int:
         context = ToolExecutionContext(
             workspace_root, Path.cwd().resolve(), runtime.session_dir, sanitized_environment()
         )
-        executor = ToolExecutor(registry, permissions, context, runtime)
         mcp_manager = McpManager(config.mcp, registry, workspace_root, ui=ui)
         registry.register(ToolSearchTool(registry, mcp_manager))
         system_prompt = build_system_prompt(
@@ -101,14 +106,31 @@ async def _run(args: argparse.Namespace) -> int:
         )
         context_window = ContextWindow(system_prompt)
         client = create_model_client(resolved)
+        context_manager = ContextManager(
+            manager,
+            client,
+            runtime,
+            config.context,
+            estimator,
+            recovery,
+            system_prompt,
+            resolved.profile.max_output_tokens,
+        )
+        executor = ToolExecutor(
+            registry,
+            permissions,
+            context,
+            runtime,
+            config.context,
+            estimator,
+            context_manager.observe_tool_result,
+        )
     except HammerCodeError as exc:
         ui.error(str(exc))
         return 2
     except OSError:
         ui.error("Unable to resolve the project runtime paths.")
         return 2
-    manager = ConversationManager()
-    manager.create(resolved)
     ui.banner(
         resolved.name,
         resolved.profile.protocol,
@@ -128,13 +150,16 @@ async def _run(args: argparse.Namespace) -> int:
             executor,
             context_window,
             mcp_manager,
+            context_manager,
         ).run()
     finally:
         try:
             await mcp_manager.close()
         finally:
-            await client.aclose()
-            runtime.cleanup()
+            try:
+                await client.aclose()
+            finally:
+                runtime.cleanup()
     return 0
 
 
