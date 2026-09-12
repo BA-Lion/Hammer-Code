@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Protocol
 
 from rich.cells import cell_len
@@ -14,6 +15,8 @@ from hammer_code.domain.events import CompactEvent
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import UsageSummary
 from hammer_code.permissions.models import ApprovalChoice, PermissionRequest
+
+_STREAM_FLUSH_CELLS = 32
 
 
 class ConsolePort(Protocol):
@@ -87,8 +90,7 @@ class ConsoleUI:
             if not self._stream_buffer:
                 self._stream_style = None
 
-        target_width = max(1, self.console.width - 1)
-        if self._stream_buffer and cell_len(self._stream_buffer) >= target_width:
+        if self._stream_buffer and cell_len(self._stream_buffer) >= _STREAM_FLUSH_CELLS:
             self._flush_stream_buffer()
 
     def banner(self, profile: str, protocol: str, model: str, origin: str) -> None:
@@ -114,7 +116,7 @@ class ConsoleUI:
             return
         self._finish_stream_line()
         self._thinking_active = True
-        if self.console.is_terminal:
+        if self.console.is_terminal and sys.platform != "win32":
             self._thinking_status = self.console.status(
                 "[dim]Thinking…[/]", spinner="dots", spinner_style="dim"
             )

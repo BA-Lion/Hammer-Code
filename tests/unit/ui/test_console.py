@@ -5,6 +5,7 @@ from rich.console import Console
 from hammer_code.domain.events import CompactEvent
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus, UsageSummary
+from hammer_code.ui import console as console_module
 from hammer_code.ui.console import ConsoleUI
 
 
@@ -33,6 +34,18 @@ def test_console_allows_thinking_status_on_next_turn_after_usage() -> None:
     assert output.getvalue().count("Thinking…") == 2
 
 
+def test_console_uses_static_thinking_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(console_module.sys, "platform", "win32")
+    output = StringIO()
+    ui = ConsoleUI(Console(file=output, force_terminal=True, color_system="standard"))
+
+    ui.reasoning_status()
+
+    assert "Thinking…" in output.getvalue()
+    assert ui._thinking_status is None
+    assert "\x1b[?25l" not in output.getvalue()
+
+
 def test_console_streaming_does_not_insert_line_breaks_between_cjk_deltas() -> None:
     output = StringIO()
     ui = ConsoleUI(Console(file=output, force_terminal=False, width=12))
@@ -40,8 +53,9 @@ def test_console_streaming_does_not_insert_line_breaks_between_cjk_deltas() -> N
 
     for chunk in chunks:
         ui.text_delta(chunk)
+    ui.info("done")
 
-    assert output.getvalue() == "".join(chunks)
+    assert output.getvalue() == "".join(chunks) + "\ndone\n"
 
 
 def test_console_reasoning_stream_uses_the_same_soft_wrap_path() -> None:
@@ -51,8 +65,9 @@ def test_console_reasoning_stream_uses_the_same_soft_wrap_path() -> None:
 
     for chunk in chunks:
         ui.reasoning_delta(chunk, ReasoningVisibility.VISIBLE)
+    ui.info("done")
 
-    assert output.getvalue() == "".join(chunks)
+    assert output.getvalue() == "".join(chunks) + "\ndone\n"
 
 
 def test_console_tool_notice_is_a_styled_block_separate_from_model_text() -> None:
@@ -90,15 +105,19 @@ def test_console_coalesces_post_tool_token_deltas_until_the_next_block() -> None
     assert "".join(chunks) + "\nUsage:" in output.getvalue()
 
 
-def test_console_flushes_a_coalesced_stream_after_reaching_terminal_width() -> None:
-    output = StringIO()
-    ui = ConsoleUI(Console(file=output, force_terminal=False, width=12))
-    chunks = ("中文", "路径", "测试")
+def test_console_stream_batching_is_independent_of_terminal_width() -> None:
+    narrow_output = StringIO()
+    wide_output = StringIO()
+    narrow_ui = ConsoleUI(Console(file=narrow_output, force_terminal=False, width=12))
+    wide_ui = ConsoleUI(Console(file=wide_output, force_terminal=False, width=120))
+    chunks = ("中文路径测试甲乙", "丙丁戊己庚辛壬癸")
 
     for chunk in chunks:
-        ui.text_delta(chunk)
+        narrow_ui.text_delta(chunk)
+        wide_ui.text_delta(chunk)
 
-    assert output.getvalue() == "".join(chunks)
+    assert narrow_output.getvalue() == "".join(chunks)
+    assert wide_output.getvalue() == narrow_output.getvalue()
 
 
 def test_console_displays_context_estimates_as_a_compaction_block() -> None:
