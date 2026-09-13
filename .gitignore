@@ -12,4 +12,6 @@ build/
 .hammer-code/config.toml
 .hammer-code/runtime/
 .hammer-code/tmp/
+/.hammer-code/sessions/
+/.hammer-code/memory/
 Trial/

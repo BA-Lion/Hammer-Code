@@ -66,6 +66,9 @@ class RecoveryState:
 class ContextPreparation:
     compact_event: CompactEvent | None = None
     cleanup_failed: bool = False
+    history_replaced: bool = False
+    summary: str | None = None
+    summarized_turn_positions: tuple[int, ...] = ()
 
 
 class ContextManager:
@@ -251,7 +254,11 @@ class ContextManager:
                 kept_ids = self._tool_result_ids(replacement)
                 cleanup_failed = bool(self.runtime.delete_results(old_ids - kept_ids))
                 return ContextPreparation(
-                    CompactEvent(before, after, max(0, before - after)), cleanup_failed
+                    CompactEvent(before, after, max(0, before - after)),
+                    cleanup_failed,
+                    history_replaced=True,
+                    summary=summary,
+                    summarized_turn_positions=tuple(range(2, len(turns))),
                 )
             except ContextCompactionError as exc:
                 last_error = exc

@@ -20,6 +20,30 @@ COMPACT_BOUNDARY_MESSAGE = (
 )
 
 
+def build_stale_restore_prompt() -> str:
+    return (
+        "# Restored-session reminder\nThis history may be over 24 hours old. Preserve the user's "
+        "goals, but re-check repository files, configuration, dependencies, command results, "
+        "external facts, and task progress before relying on historical claims.\n"
+    )
+
+
+def build_memory_index_prompt(indexes: object) -> str:
+    """Render a non-authoritative fixed index listing without reading topic bodies."""
+    lines: list[str] = []
+    for category, entries in getattr(indexes, "items", lambda: ())():
+        lines.append(f"## {category}")
+        lines.extend(str(entry) for entry in entries)
+    if not lines:
+        return ""
+    return (
+        "# Long-term memory index\nMemory is historical and non-authoritative. Current user "
+        "instructions and workspace facts prevail; read relevant files to verify details.\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 def build_recovery_prompt(entries: Iterable[object]) -> str:
     """Build a non-authoritative recovery hint from ordered RecoveryEntry-like values."""
     lines: list[str] = []

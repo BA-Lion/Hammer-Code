@@ -23,6 +23,9 @@ from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import ContextCompactionError, HammerCodeError, StreamInterruptedError
 from hammer_code.llm.client import ModelClient
 from hammer_code.mcp.manager import McpManager
+from hammer_code.memory.service import MemoryService
+from hammer_code.prompts import build_stale_restore_prompt
+from hammer_code.session.session import SessionCoordinator
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.ui.console import ConsolePort
@@ -42,6 +45,10 @@ class ChatLoop:
         context_window: ContextWindow | None = None,
         mcp_manager: McpManager | None = None,
         context_manager: ContextManager | None = None,
+        session_coordinator: SessionCoordinator | None = None,
+        memory_service: MemoryService | None = None,
+        project_instructions: str = "",
+        stale_restore: bool = False,
     ) -> None:
         (
             self.manager,
@@ -55,6 +62,10 @@ class ChatLoop:
             self.context_window,
             self.mcp_manager,
             self.context_manager,
+            self.session_coordinator,
+            self.memory_service,
+            self.project_instructions,
+            self.stale_restore,
         ) = (
             manager,
             client,
@@ -67,28 +78,42 @@ class ChatLoop:
             context_window or ContextWindow(system_prompt),
             mcp_manager,
             context_manager,
+            session_coordinator,
+            memory_service,
+            project_instructions,
+            stale_restore,
         )
         self._exit = False
 
     async def run(self) -> None:
-        while not self._exit:
-            try:
-                text = await self.ui.prompt()
-            except (EOFError, KeyboardInterrupt):
-                return
-            if not text.strip():
-                continue
-            if text.startswith("/"):
-                await self._command(text)
-            else:
-                task = asyncio.create_task(self.run_turn(text))
+        try:
+            while not self._exit:
                 try:
-                    await task
-                except KeyboardInterrupt:
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
+                    text = await self.ui.prompt()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if not text.strip():
+                    continue
+                if text.startswith("/"):
+                    await self._command(text)
+                else:
+                    task = asyncio.create_task(self.run_turn(text))
+                    try:
                         await task
-                    self.ui.error("Request cancelled.")
+                    except KeyboardInterrupt:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+                        self.ui.error("Request cancelled.")
+        finally:
+            if self.memory_service is not None:
+                await self.memory_service.cancel()
+            if self.session_coordinator is not None:
+                await self.session_coordinator.close()
+                if self.session_coordinator.persistence_degraded:
+                    self.ui.persistence_warning(
+                        "Saved history may be incomplete after this exit.", final=True
+                    )
 
     async def _command(self, text: str) -> None:
         if text == "/help":
@@ -96,6 +121,8 @@ class ChatLoop:
         elif text == "/clear":
             try:
                 self.manager.clear()
+                if self.session_coordinator is not None:
+                    await self.session_coordinator.clear_history()
                 cleanup_ok = self.context_manager.clear() if self.context_manager else True
                 if self.registry:
                     self.registry.clear_discovered()
@@ -119,7 +146,11 @@ class ChatLoop:
                 return
             try:
                 prompt, tools = self._sample_context()
+                before = self.manager.snapshot_committed()
+                if self.memory_service is not None:
+                    await self.memory_service.flush_before_compaction()
                 preparation = await self.context_manager.compact_now(mcp_prompt=prompt, tools=tools)
+                await self._persist_preparation(before, preparation)
                 if preparation.compact_event is None:
                     self.ui.info("Nothing to compact.")
                 else:
@@ -143,10 +174,14 @@ class ChatLoop:
             if self.context_manager is not None:
                 pending = Message(Role.USER, (TextBlock(text),))
                 prompt, tools = self._sample_context()
+                before = self.manager.snapshot_committed()
+                if self.memory_service is not None:
+                    await self.memory_service.flush_before_compaction()
                 preparation = await self.context_manager.prepare_before_request(
                     current_suffix=(pending,), mcp_prompt=prompt, tools=tools
                 )
                 self._show_preparation(preparation)
+                await self._persist_preparation(before, preparation)
             turn = self.manager.begin_turn(text)
             while request_count < 50:
                 request_count += 1
@@ -156,14 +191,24 @@ class ChatLoop:
                 reasoning_status_started = False
                 prompt, tools = self._sample_context()
                 if self.context_manager is not None and request_count > 1:
+                    before = self.manager.snapshot_committed()
                     preparation = await self.context_manager.prepare_before_request(
                         current_suffix=self.manager.snapshot_staged(turn),
                         mcp_prompt=prompt,
                         tools=tools,
                     )
                     self._show_preparation(preparation)
+                    await self._persist_preparation(before, preparation)
+                memory_prompt = (
+                    await self.memory_service.read_index_prompt()
+                    if self.memory_service is not None
+                    else ""
+                )
                 snapshot = self.context_window.snapshot(
                     mcp_prompt=prompt,
+                    project_instructions=self.project_instructions,
+                    memory_prompt=memory_prompt,
+                    stale_prompt=build_stale_restore_prompt() if self.stale_restore else "",
                     recovery_prompt=self.context_manager.recovery_prompt
                     if self.context_manager
                     else "",
@@ -214,7 +259,8 @@ class ChatLoop:
                     block for block in response.message.content if isinstance(block, ToolCallBlock)
                 )
                 if response.stop_reason.value != "tool_call":
-                    self.manager.commit(turn, response.message)
+                    committed = self.manager.commit(turn, response.message)
+                    await self._persist_turn_outcome(committed, completed=True)
                     return
                 if not calls or {call.call_id for call in calls} != announced_calls:
                     raise StreamInterruptedError(
@@ -227,25 +273,30 @@ class ChatLoop:
                 if call_count > 200 or unknown_count > 3 or self.executor is None:
                     self.manager.stage_tool_call(turn, response.message)
                     self.ui.error("Tool loop limit reached or tool executor is unavailable")
-                    self.manager.interrupt(turn)
+                    committed = self.manager.interrupt(turn)
+                    await self._persist_turn_outcome(committed, completed=False)
                     return
                 self.manager.stage_tool_call(turn, response.message)
                 results = await self.executor.execute_batch(calls)
                 self.manager.stage_tool_results(turn, Message(Role.USER, tuple(results)))
             self.ui.error("Tool loop request limit reached")
-            self.manager.interrupt(turn)
+            committed = self.manager.interrupt(turn)
+            await self._persist_turn_outcome(committed, completed=False)
         except ToolBatchCancelled as exc:
             if turn is not None:
                 self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
-                self.manager.interrupt(turn)
+                committed = self.manager.interrupt(turn)
+                await self._persist_turn_outcome(committed, completed=False)
             raise asyncio.CancelledError from exc
         except asyncio.CancelledError:
             if turn is not None:
-                self.manager.interrupt(turn)
+                committed = self.manager.interrupt(turn)
+                await self._persist_turn_outcome(committed, completed=False)
             raise
         except Exception as exc:
             if turn is not None:
-                self.manager.interrupt(turn)
+                committed = self.manager.interrupt(turn)
+                await self._persist_turn_outcome(committed, completed=False)
             self.ui.error(
                 str(exc) if isinstance(exc, HammerCodeError) else "Unexpected model failure"
             )
@@ -267,3 +318,32 @@ class ChatLoop:
             self.ui.error(
                 "Context compacted, but some temporary tool results could not be removed."
             )
+
+    async def _persist_turn_outcome(
+        self, messages: tuple[Message, ...], *, completed: bool
+    ) -> None:
+        if self.session_coordinator is None or not messages:
+            return
+        await self.session_coordinator.append_turn(messages, completed=completed)
+        if self.session_coordinator.persistence_degraded:
+            self.ui.persistence_warning(
+                "Conversation continues in memory; recent history may be lost after interruption."
+            )
+            return
+        if self.memory_service is not None:
+            self.memory_service.maybe_schedule()
+
+    async def _persist_preparation(self, before: tuple[Message, ...], preparation: object) -> None:
+        if self.session_coordinator is None or not getattr(preparation, "history_replaced", False):
+            return
+        summary = getattr(preparation, "summary", None)
+        positions = getattr(preparation, "summarized_turn_positions", ())
+        if not isinstance(summary, str) or not isinstance(positions, tuple):
+            self.ui.persistence_warning("Compacted history could not be saved.")
+            return
+        await self.session_coordinator.rewrite_after_compaction(
+            before,
+            self.manager.snapshot_committed(),
+            summary=summary,
+            summarized_turn_positions=positions,
+        )

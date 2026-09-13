@@ -31,6 +31,9 @@ class ConsolePort(Protocol):
     def usage(self, summary: UsageSummary) -> None: ...
     def help(self) -> None: ...
     def compact(self, event: CompactEvent) -> None: ...
+    def sessions(self, items: tuple[object, ...]) -> None: ...
+    def persistence_warning(self, message: str, *, final: bool = False) -> None: ...
+    def memory_warning(self, message: str) -> None: ...
     async def approve(self, request: PermissionRequest, reason: str) -> ApprovalChoice: ...
 
 
@@ -169,7 +172,7 @@ class ConsoleUI:
 
     def usage(self, summary: UsageSummary) -> None:
         self._begin_block()
-        total = summary.usage.total_tokens
+        total = summary.total_tokens
         total_text = str(total) if total is not None else "unavailable"
         self.console.print(
             "[dim]Usage: "
@@ -191,3 +194,23 @@ class ConsoleUI:
             f"Compacted context: ~{event.before_tokens} → ~{event.after_tokens} tokens; "
             f"saved ~{event.saved_tokens}"
         )
+
+    def sessions(self, items: tuple[object, ...]) -> None:
+        self._begin_block()
+        if not items:
+            self.console.print("No saved sessions.")
+            return
+        for item in items:
+            self.console.print(
+                f"{getattr(item, 'id', '')}  {getattr(item, 'last_active', '')}  "
+                f"{getattr(item, 'title', '')}"
+            )
+
+    def persistence_warning(self, message: str, *, final: bool = False) -> None:
+        self._begin_block()
+        prefix = "Final persistence warning" if final else "Persistence warning"
+        self.console.print(f"[bold yellow]{prefix}:[/] {message}")
+
+    def memory_warning(self, message: str) -> None:
+        self._begin_block()
+        self.console.print(f"[yellow]Memory warning:[/] {message}")

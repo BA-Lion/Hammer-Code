@@ -50,11 +50,18 @@ class UsageSummary:
     final_requests: int
     partial_requests: int
     unavailable_requests: int
+    total_tokens: int | None = None
 
 
 class UsageLedger:
     def __init__(self) -> None:
         self._entries: dict[str, tuple[str, TokenUsage]] = {}
+        self._baseline_total_tokens: int | None = None
+
+    def restore_total_tokens(self, value: int) -> None:
+        if value < 0 or self._entries or self._baseline_total_tokens is not None:
+            raise ValueError("Usage baseline may only be set once on an empty ledger")
+        self._baseline_total_tokens = value
 
     def upsert(self, request_id: str, turn_id: str, usage: TokenUsage) -> None:
         old = self._entries.get(request_id)
@@ -81,9 +88,9 @@ class UsageLedger:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._baseline_total_tokens = None
 
-    @staticmethod
-    def _summarize(usages: Iterable[TokenUsage]) -> UsageSummary:
+    def _summarize(self, usages: Iterable[TokenUsage]) -> UsageSummary:
         entries = list(usages)
         if not entries:
             return UsageSummary(
@@ -91,6 +98,7 @@ class UsageLedger:
                 final_requests=0,
                 partial_requests=0,
                 unavailable_requests=0,
+                total_tokens=self._baseline_total_tokens,
             )
         known_input = [u.input_tokens for u in entries if u.input_tokens is not None]
         known_output = [u.output_tokens for u in entries if u.output_tokens is not None]
@@ -109,9 +117,13 @@ class UsageLedger:
                 else UsageStatus.PARTIAL
             ),
         )
+        totals = [item.total_tokens for item in entries if item.total_tokens is not None]
         return UsageSummary(
             usage,
             status_counts[UsageStatus.FINAL],
             status_counts[UsageStatus.PARTIAL],
             status_counts[UsageStatus.UNAVAILABLE],
+            (self._baseline_total_tokens or 0) + sum(totals)
+            if self._baseline_total_tokens is not None or totals
+            else None,
         )

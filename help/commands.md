@@ -127,3 +127,14 @@ uv build
 ```
 
 默认测试只使用合成事件，不联网、不读取真实密钥。`dist/` 中的 wheel 与 source distribution 是构建输出。
+## Session persistence
+
+`hammer-code` creates a local session under `.hammer-code/sessions/`. Use `--list-sessions` to
+list valid saved sessions without initializing a model client, or `--resume <id|latest>` to resume
+a compatible session. Sessions with a `last_active` timestamp strictly older than 30 days are
+deleted at startup and cannot be recovered by Hammer Code; copy a session directory manually before
+that boundary if it must be retained.
+
+Project-local `hammer-code.md` may provide instructions and bounded relative `@include(...)` files.
+Memory and project instructions are non-authoritative context: they never grant tool permissions or
+override current user instructions and verified workspace facts.

@@ -100,14 +100,16 @@ class ConversationManager:
             turn.request_ids.append(request_id)
         self.conversation.usage_ledger.upsert(request_id, turn.id, usage)
 
-    def commit(self, turn: TurnTransaction, assistant_message: Message) -> None:
+    def commit(self, turn: TurnTransaction, assistant_message: Message) -> tuple[Message, ...]:
         self._assert_active(turn)
         if assistant_message.role is not Role.ASSISTANT:
             raise ConversationError("Only an assistant message can be committed")
         assert self.conversation is not None
-        self.conversation.messages.extend((*turn.staged_messages, assistant_message))
+        committed = (*turn.staged_messages, assistant_message)
+        self.conversation.messages.extend(committed)
         turn.status = TurnStatus.COMMITTED
         self._active_turn = None
+        return committed
 
     def abort(self, turn: TurnTransaction) -> None:
         self._assert_active(turn)
@@ -142,7 +144,7 @@ class ConversationManager:
             raise ConversationError("Tool results must exactly match the preceding tool call ids")
         turn.staged_messages.append(user_message)
 
-    def interrupt(self, turn: TurnTransaction) -> None:
+    def interrupt(self, turn: TurnTransaction) -> tuple[Message, ...]:
         """Commit complete tool exchanges after an interrupted later model request."""
         self._assert_active(turn)
         has_exchange = any(
@@ -156,11 +158,25 @@ class ConversationManager:
         )
         if not has_exchange:
             self.abort(turn)
-            return
+            return ()
         assert self.conversation is not None
-        self.conversation.messages.extend(turn.staged_messages)
+        committed = tuple(turn.staged_messages)
+        self.conversation.messages.extend(committed)
         turn.status = TurnStatus.INTERRUPTED
         self._active_turn = None
+        return committed
+
+    def restore(
+        self, profile_identity: object, messages: tuple[Message, ...], usage_total: int
+    ) -> Conversation:
+        if self._active_turn is not None or self.conversation is not None:
+            raise ConversationBusyError("Can only restore into an empty conversation")
+        if usage_total < 0:
+            raise ConversationError("Restored usage total must not be negative")
+        conversation = self.create(profile_identity)
+        conversation.messages.extend(messages)
+        conversation.usage_ledger.restore_total_tokens(usage_total)
+        return conversation
 
     def clear(self) -> None:
         if self._active_turn is not None:

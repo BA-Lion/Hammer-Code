@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,11 +18,16 @@ from hammer_code.conversation.manager import ConversationManager
 from hammer_code.errors import HammerCodeError
 from hammer_code.llm.factory import create_model_client
 from hammer_code.mcp.manager import McpManager
+from hammer_code.memory.service import MemoryService
+from hammer_code.memory.store import MemoryStore
 from hammer_code.permissions.checker import PermissionChecker
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.rules import RuleStore
 from hammer_code.permissions.service import PermissionService
+from hammer_code.project_instructions import ProjectInstructionLoader
 from hammer_code.prompts import PromptRuntimeContext, build_system_prompt
+from hammer_code.session.manager import SessionManager
+from hammer_code.session.session import SessionCoordinator
 from hammer_code.tools.base import ToolExecutionContext
 from hammer_code.tools.builtin import (
     CreateFileTool,
@@ -51,6 +57,11 @@ def parser() -> argparse.ArgumentParser:
         default=PermissionMode.DEFAULT.value,
         help="Local tool permission mode",
     )
+    actions = value.add_mutually_exclusive_group()
+    actions.add_argument("--resume", metavar="ID_OR_LATEST", help="Resume a compatible session")
+    actions.add_argument(
+        "--list-sessions", action="store_true", help="List saved sessions and exit"
+    )
     return value
 
 
@@ -59,6 +70,12 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         path = discover_config(args.config)
         config = load_config(path)
+        workspace_root = path.parent.parent.resolve()
+        sessions = SessionManager(workspace_root)
+        await asyncio.to_thread(sessions.cleanup)
+        if getattr(args, "list_sessions", False):
+            ui.sessions(sessions.list())
+            return 0
         profile_name = args.profile or config.default_profile
         profile = config.profiles.get(profile_name)
         if profile is None:
@@ -70,13 +87,27 @@ async def _run(args: argparse.Namespace) -> int:
         ):
             raise HammerCodeError("Unattended mode was not confirmed")
         resolved = resolve_profile(config, args.profile)
-        workspace_root = path.parent.parent.resolve()
+        project_instructions = ProjectInstructionLoader(workspace_root).load()
         runtime = RuntimeStore(workspace_root)
         runtime.cleanup_old()
         estimator = TokenEstimator()
         recovery = RecoveryState(config.context)
         manager = ConversationManager()
-        manager.create(resolved)
+        resume_id = getattr(args, "resume", None)
+        session = sessions.open(resume_id, resolved.profile.protocol) if resume_id else None
+        stale_restore = False
+        if session is not None:
+            old_last_active = session.meta.last_active
+            restored = session.load()
+            stale_restore = (datetime.now(UTC) - old_last_active.astimezone(UTC)) > timedelta(
+                hours=24
+            )
+            manager.restore(resolved, restored.messages, session.meta.total_tokens)
+            session.touch()
+            coordinator = SessionCoordinator.restored(session, manager, restored)
+        else:
+            manager.create(resolved)
+            coordinator = SessionCoordinator(sessions.create(resolved.profile.protocol), manager)
         registry = ToolRegistry(config.tools.disabled)
         for tool in (
             ReadFileTool(),
@@ -139,6 +170,14 @@ async def _run(args: argparse.Namespace) -> int:
     )
     try:
         mcp_manager.start()
+        memory_service = MemoryService(
+            client,
+            MemoryStore(workspace_root),
+            coordinator,
+            ui,
+            resolved.profile.max_output_tokens,
+            executor,
+        )
         await ChatLoop(
             manager,
             client,
@@ -151,6 +190,10 @@ async def _run(args: argparse.Namespace) -> int:
             context_window,
             mcp_manager,
             context_manager,
+            coordinator,
+            memory_service,
+            project_instructions,
+            stale_restore,
         ).run()
     finally:
         try:

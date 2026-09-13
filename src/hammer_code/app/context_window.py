@@ -24,13 +24,23 @@ class ContextWindow:
         self,
         *,
         mcp_prompt: str,
+        project_instructions: str = "",
+        memory_prompt: str = "",
+        stale_prompt: str = "",
         recovery_prompt: str = "",
         messages: tuple[Message, ...],
         tools: tuple[ToolDefinition, ...],
     ) -> ContextSnapshot:
         sections = tuple(
             section.strip()
-            for section in (self._base_system_prompt, mcp_prompt, recovery_prompt)
+            for section in (
+                self._base_system_prompt,
+                project_instructions,
+                mcp_prompt,
+                memory_prompt,
+                stale_prompt,
+                recovery_prompt,
+            )
             if section.strip()
         )
         prompt = "\n\n".join(sections) + ("\n" if sections else "")

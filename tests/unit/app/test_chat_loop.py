@@ -80,6 +80,15 @@ class FakeUI:
     def compact(self, event) -> None:
         pass
 
+    def sessions(self, items: tuple[object, ...]) -> None:
+        pass
+
+    def persistence_warning(self, message: str, *, final: bool = False) -> None:
+        self.errors.append(message)
+
+    def memory_warning(self, message: str) -> None:
+        self.errors.append(message)
+
 
 class FakeClient(ModelClient):
     def __init__(
