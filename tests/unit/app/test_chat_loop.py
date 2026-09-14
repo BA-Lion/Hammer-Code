@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from hammer_code.app.chat_loop import ChatLoop
+from hammer_code.app.context_manager import ContextPreparation
 from hammer_code.app.context_window import ContextWindow
 from hammer_code.config import AppConfig, resolve_profile
 from hammer_code.conversation.manager import ConversationManager
@@ -157,6 +158,70 @@ class CancelledExecutor:
         raise ToolBatchCancelled(
             (ToolResultBlock(calls[0].call_id, (TextBlock("cancelled"),), True),)
         )
+
+
+class _NonCompactingContext:
+    recovery_prompt = ""
+
+    async def prepare_before_request(self, **kwargs) -> ContextPreparation:
+        assert kwargs["before_compaction"] is not None
+        return ContextPreparation()
+
+
+class _MemoryMustNotFlush:
+    async def flush_before_compaction(self) -> bool:
+        raise AssertionError("ordinary main requests must not flush Memory")
+
+    async def read_index_prompt(self) -> str:
+        return ""
+
+
+class _FailedCompactionPersistence:
+    persistence_degraded = False
+
+    async def rewrite_after_compaction(self, *args, **kwargs) -> None:
+        self.persistence_degraded = True
+
+
+@pytest.mark.asyncio
+async def test_ordinary_main_request_does_not_wait_for_memory_flush() -> None:
+    manager = _manager()
+    await ChatLoop(
+        manager,
+        FakeClient(),
+        FakeUI(),
+        "system",
+        5,
+        context_manager=_NonCompactingContext(),  # type: ignore[arg-type]
+        memory_service=_MemoryMustNotFlush(),  # type: ignore[arg-type]
+    ).run_turn("hi")
+    assert manager.conversation and len(manager.conversation.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_persistence_failure_is_reported_immediately() -> None:
+    manager = _manager()
+    ui = FakeUI()
+    coordinator = _FailedCompactionPersistence()
+    loop = ChatLoop(
+        manager,
+        FakeClient(),
+        ui,
+        "system",
+        5,
+        session_coordinator=coordinator,  # type: ignore[arg-type]
+    )
+
+    await loop._persist_preparation(
+        manager.snapshot_committed(),
+        ContextPreparation(
+            history_replaced=True,
+            summary="summary",
+            summarized_turn_positions=(1,),
+        ),
+    )
+
+    assert ui.errors == ["Context compacted in memory, but compacted history could not be saved."]
 
 
 def _manager() -> ConversationManager:

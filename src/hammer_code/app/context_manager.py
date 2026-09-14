@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -115,6 +116,7 @@ class ContextManager:
         current_suffix: tuple[Message, ...],
         mcp_prompt: str,
         tools: tuple[ToolDefinition, ...],
+        before_compaction: Callable[[], Awaitable[object]] | None = None,
     ) -> ContextPreparation:
         self._trim_stale_tool_results()
         before = self._estimate(
@@ -122,6 +124,8 @@ class ContextManager:
         )
         if before < self.config.compact_trigger_tokens:
             return ContextPreparation()
+        if before_compaction is not None:
+            await before_compaction()
         return await self._compact(current_suffix, mcp_prompt, tools, before, manual=False)
 
     async def compact_now(

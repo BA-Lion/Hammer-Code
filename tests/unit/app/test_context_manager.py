@@ -175,6 +175,49 @@ async def test_manual_compaction_without_middle_turn_is_a_noop(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_automatic_compaction_runs_callback_only_after_crossing_trigger(
+    tmp_path: Path,
+) -> None:
+    manager = _manager()
+    runtime = RuntimeStore(tmp_path)
+    config = ContextConfig(
+        max_context_tokens=2000, compact_trigger_tokens=1500, summary_target_tokens=100
+    )
+    context = ContextManager(
+        manager,
+        SummaryClient(),
+        runtime,
+        config,
+        TokenEstimator(),
+        RecoveryState(config),
+        "base",
+        100,
+    )
+    calls: list[str] = []
+
+    async def before_compaction() -> None:
+        calls.append("flush")
+
+    try:
+        below = await context.prepare_before_request(
+            current_suffix=(), mcp_prompt="", tools=(), before_compaction=before_compaction
+        )
+        assert below.compact_event is None
+        assert calls == []
+
+        context.config = ContextConfig(
+            max_context_tokens=2000, compact_trigger_tokens=200, summary_target_tokens=100
+        )
+        compacted = await context.prepare_before_request(
+            current_suffix=(), mcp_prompt="", tools=(), before_compaction=before_compaction
+        )
+        assert compacted.compact_event is not None
+        assert calls == ["flush"]
+    finally:
+        runtime.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_manual_compaction_reports_last_failure_and_preserves_history(
     tmp_path: Path,
 ) -> None:

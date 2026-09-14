@@ -316,11 +316,22 @@ class SessionCoordinator:
         if self.manager.conversation is None:
             return
         try:
-            records = self._records_for_history(self.manager.snapshot_committed())
+            history = self.manager.snapshot_committed()
+            positions = self._split_turns(history)
+            # When the current Conversation still matches the coordinator projection, reuse the
+            # durable records verbatim. Reprojecting a compacted summary would turn its COMPRESSION
+            # record into ordinary USER/ASSISTANT records and renumber the durable turn indices.
+            records = (
+                tuple(self._records)
+                if positions == self._turn_positions
+                else self._records_for_history(history)
+            )
             await asyncio.to_thread(
                 self.session.rewrite, records, total_tokens=self._total_tokens()
             )
             self._records = list(records)
+            self._turn_positions = positions
+            self._next_turn_index = max((record.turn_index for record in records), default=0) + 1
         except Exception:
             self.session.persistence_degraded = True
 

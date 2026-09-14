@@ -24,7 +24,11 @@ from hammer_code.domain.messages import (
 )
 from hammer_code.llm.client import ModelClient
 from hammer_code.memory.models import MemoryBatch
-from hammer_code.memory.prompts import EXTRACTION_PROMPT, MERGE_PROMPT
+from hammer_code.memory.prompts import (
+    EXTRACTION_PROMPT,
+    MERGE_CORRECTION_PROMPT,
+    MERGE_PROMPT,
+)
 from hammer_code.memory.store import MemoryStore, MemoryStoreError
 from hammer_code.permissions.paths import PathPolicy
 from hammer_code.prompts import build_memory_index_prompt
@@ -38,6 +42,7 @@ _CATEGORY_KEYS = (
     "project-knowledge",
     "references",
 )
+_MAX_MERGE_CORRECTIONS = 2
 
 
 class MemoryResponseError(ValueError):
@@ -77,6 +82,7 @@ class MemoryService:
     def __post_init__(self) -> None:
         self._task: asyncio.Task[bool] | None = None
         self._pending = False
+        self._last_attempted_target = 0
 
     async def read_index_prompt(self) -> str:
         try:
@@ -118,30 +124,43 @@ class MemoryService:
             pass
 
     async def _run(self, *, force: bool) -> bool:
+        stage = "session scan"
         try:
             restore = await asyncio.to_thread(self.coordinator.session.load)
             cursor = min(self.coordinator.session.meta.memory_cursor, restore.latest_durable_turn)
-            completed_after = sum(turn > cursor for turn in restore.completed_turns)
+            if restore.latest_durable_turn < self._last_attempted_target:
+                self._last_attempted_target = cursor
+            schedule_cursor = cursor if force else max(cursor, self._last_attempted_target)
+            completed_after = sum(turn > schedule_cursor for turn in restore.completed_turns)
             if not force and completed_after < 5:
                 return True
             target = restore.latest_durable_turn
             if target <= cursor:
                 return True
+            self._last_attempted_target = max(self._last_attempted_target, target)
             messages = self._maintenance_messages(restore.records, cursor, target)
+            stage = "candidate extraction"
             candidates = await self._extract_candidates(messages, cursor, target)
+            stage = "candidate merge"
             batch = await self._merge_candidates(candidates)
+            stage = "batch validation"
             prepared = await asyncio.to_thread(self.store.prepare_batch, batch)
+            stage = "batch commit"
             await asyncio.to_thread(self.store.commit_batch, prepared)
+            stage = "session verification"
             latest = await asyncio.to_thread(self.coordinator.session.load)
             if latest.latest_durable_turn < target:
                 raise MemoryResponseError("Session is no longer durable through the Memory target")
+            stage = "cursor commit"
             if not self.coordinator.session.compare_replace_meta(cursor, target):
                 raise MemoryResponseError("Memory cursor changed before commit")
             return True
         except asyncio.CancelledError:
             raise
-        except (MemoryResponseError, MemoryStoreError, OSError, ValueError):
-            self.ui.memory_warning("Memory maintenance did not complete; it will retry later.")
+        except Exception:
+            self.ui.memory_warning(
+                f"Memory maintenance failed during {stage}; it will retry later."
+            )
             return False
         finally:
             task = asyncio.current_task()
@@ -152,7 +171,11 @@ class MemoryService:
     async def _extract_candidates(
         self, messages: tuple[Message, ...], cursor: int, target: int
     ) -> CandidateSet:
-        text = await self._request_text(EXTRACTION_PROMPT, messages, tools=())
+        prompt = (
+            EXTRACTION_PROMPT
+            + f"\n\nValid evidence_turns range: {cursor} < turn_index <= {target}."
+        )
+        text = await self._request_text(prompt, messages, tools=())
         try:
             result = CandidateSet.model_validate_json(text)
         except ValidationError as exc:
@@ -173,22 +196,15 @@ class MemoryService:
                 TextBlock(
                     "Candidates:\n"
                     + candidates.model_dump_json(by_alias=True)
-                    + "\n\nIndexes:\n"
-                    + build_memory_index_prompt(
-                        {
-                            category.value: tuple(
-                                f"- [{entry.memory_id}]({entry.path}): {entry.description}"
-                                for entry in value.index.entries
-                            )
-                            for category, value in catalog.categories.items()
-                        }
-                    )
+                    + "\n\nMemory catalog:\n"
+                    + self._merge_catalog(catalog)
                 ),
             ),
         )
         definition = self._read_file_definition()
         messages: list[Message] = [context]
         reads = 0
+        corrections = 0
         for _ in range(20):
             completed = await self._request_response(MERGE_PROMPT, tuple(messages), (definition,))
             response = completed.response
@@ -213,9 +229,22 @@ class MemoryService:
                 block.text for block in response.message.content if isinstance(block, TextBlock)
             )
             try:
-                return MemoryBatch.model_validate_json(text)
-            except ValidationError as exc:
-                raise MemoryResponseError("Memory merge response is not valid JSON") from exc
+                batch = MemoryBatch.model_validate_json(text)
+                await asyncio.to_thread(self.store.prepare_batch, batch)
+            except (ValidationError, MemoryStoreError, ValueError) as exc:
+                if corrections >= _MAX_MERGE_CORRECTIONS:
+                    raise MemoryResponseError(
+                        "Memory merge response did not pass local validation"
+                    ) from exc
+                corrections += 1
+                messages.extend(
+                    (
+                        Message(Role.ASSISTANT, (TextBlock(text),)),
+                        Message(Role.USER, (TextBlock(MERGE_CORRECTION_PROMPT),)),
+                    )
+                )
+                continue
+            return batch
         raise MemoryResponseError("Memory merge exceeded its request limit")
 
     def _read_file_definition(self) -> ToolDefinition:
@@ -240,6 +269,36 @@ class MemoryService:
             return candidate.is_relative_to(self.store.root.resolve())
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _merge_catalog(catalog: object) -> str:
+        lines: list[str] = []
+        categories = getattr(catalog, "categories", {})
+        for category, value in categories.items():
+            category_name = category.value
+            lines.append(f"## {category_name}")
+            entries = value.index.entries
+            if entries:
+                lines.append("Indexed topics:")
+                lines.extend(
+                    "- "
+                    f"memory_id={entry.memory_id}; path={entry.path}; "
+                    "read_file_path="
+                    f".hammer-code/memory/{category_name}/{entry.path}; "
+                    f"description={entry.description}"
+                    for entry in entries
+                )
+            else:
+                lines.append("Indexed topics: (none)")
+            if value.orphans:
+                lines.append("Orphan topics:")
+                lines.extend(
+                    f"- path={path}; read_file_path=.hammer-code/memory/{category_name}/{path}"
+                    for path in value.orphans
+                )
+            else:
+                lines.append("Orphan topics: (none)")
+        return "\n".join(lines)
 
     async def _request_text(
         self, prompt: str, messages: tuple[Message, ...], *, tools: tuple
@@ -321,6 +380,13 @@ class MemoryService:
                         if isinstance(item, dict) and item.get("type") == "text"
                     )
             if blocks:
+                blocks.insert(
+                    0,
+                    TextBlock(
+                        f"[Memory source turn_index={record.turn_index}; "
+                        f"record_type={record.type.value}]"
+                    ),
+                )
                 messages.append(
                     Message(
                         Role.ASSISTANT if record.type.value == "assistant" else Role.USER,

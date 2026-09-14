@@ -175,10 +175,15 @@ class ChatLoop:
                 pending = Message(Role.USER, (TextBlock(text),))
                 prompt, tools = self._sample_context()
                 before = self.manager.snapshot_committed()
-                if self.memory_service is not None:
-                    await self.memory_service.flush_before_compaction()
                 preparation = await self.context_manager.prepare_before_request(
-                    current_suffix=(pending,), mcp_prompt=prompt, tools=tools
+                    current_suffix=(pending,),
+                    mcp_prompt=prompt,
+                    tools=tools,
+                    before_compaction=(
+                        self.memory_service.flush_before_compaction
+                        if self.memory_service is not None
+                        else None
+                    ),
                 )
                 self._show_preparation(preparation)
                 await self._persist_preparation(before, preparation)
@@ -196,6 +201,11 @@ class ChatLoop:
                         current_suffix=self.manager.snapshot_staged(turn),
                         mcp_prompt=prompt,
                         tools=tools,
+                        before_compaction=(
+                            self.memory_service.flush_before_compaction
+                            if self.memory_service is not None
+                            else None
+                        ),
                     )
                     self._show_preparation(preparation)
                     await self._persist_preparation(before, preparation)
@@ -347,3 +357,7 @@ class ChatLoop:
             summary=summary,
             summarized_turn_positions=positions,
         )
+        if self.session_coordinator.persistence_degraded:
+            self.ui.persistence_warning(
+                "Context compacted in memory, but compacted history could not be saved."
+            )
