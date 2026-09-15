@@ -5,6 +5,10 @@ class HammerCodeError(Exception):
     """Base class whose message is suitable for terminal display."""
 
 
+class CommandError(HammerCodeError):
+    """A local slash-command parsing or dispatch error."""
+
+
 class ConfigurationError(HammerCodeError):
     pass
 

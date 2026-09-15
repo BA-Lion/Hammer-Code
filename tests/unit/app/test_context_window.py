@@ -1,5 +1,7 @@
 from typing import cast
 
+import pytest
+
 from hammer_code.app.context_window import ContextWindow
 from hammer_code.domain.events import ToolDefinition
 
@@ -17,3 +19,11 @@ def test_snapshot_joins_prompts_and_copies_tool_parameters() -> None:
     copied = cast(dict[str, object], snapshot.tools[0].parameters["properties"])
     copied_x = cast(dict[str, object], copied["x"])
     assert copied_x["type"] == "string"
+
+
+def test_base_prompt_can_be_replaced_but_not_emptied() -> None:
+    window = ContextWindow("old")
+    window.set_base_system_prompt("new")
+    assert window.snapshot(mcp_prompt="", messages=(), tools=()).system_prompt == "new\n"
+    with pytest.raises(ValueError, match="must not be empty"):
+        window.set_base_system_prompt("  ")

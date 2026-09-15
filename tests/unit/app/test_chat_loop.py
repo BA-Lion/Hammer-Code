@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from hammer_code.app.chat_loop import ChatLoop
+from hammer_code.app.agent import PrimaryAgent
 from hammer_code.app.context_manager import ContextPreparation
 from hammer_code.app.context_window import ContextWindow
 from hammer_code.config import AppConfig, resolve_profile
@@ -71,6 +71,12 @@ class FakeUI:
 
     async def approve(self, request, reason: str) -> ApprovalChoice:
         return ApprovalChoice.DENY
+
+    async def confirm(self, prompt: str) -> bool:
+        return False
+
+    async def choose(self, prompt: str, options: tuple[str, ...]) -> str | None:
+        return None
 
     def info(self, message: str) -> None:
         pass
@@ -186,7 +192,7 @@ class _FailedCompactionPersistence:
 @pytest.mark.asyncio
 async def test_ordinary_main_request_does_not_wait_for_memory_flush() -> None:
     manager = _manager()
-    await ChatLoop(
+    await PrimaryAgent(
         manager,
         FakeClient(),
         FakeUI(),
@@ -203,7 +209,7 @@ async def test_compaction_persistence_failure_is_reported_immediately() -> None:
     manager = _manager()
     ui = FakeUI()
     coordinator = _FailedCompactionPersistence()
-    loop = ChatLoop(
+    loop = PrimaryAgent(
         manager,
         FakeClient(),
         ui,
@@ -247,19 +253,19 @@ def _manager() -> ConversationManager:
 
 
 @pytest.mark.asyncio
-async def test_chat_loop_renders_and_commits_only_completed_response() -> None:
+async def test_primary_agent_renders_and_commits_only_completed_response() -> None:
     manager = _manager()
     ui = FakeUI()
-    await ChatLoop(manager, FakeClient(), ui, "system", 5).run_turn("hi")
+    await PrimaryAgent(manager, FakeClient(), ui, "system", 5).run_turn("hi")
     assert ui.text == ["hello"]
     assert manager.conversation and len(manager.conversation.messages) == 2
 
 
 @pytest.mark.asyncio
-async def test_chat_loop_announces_hidden_reasoning_only_once_per_turn() -> None:
+async def test_primary_agent_announces_hidden_reasoning_only_once_per_turn() -> None:
     manager = _manager()
     ui = FakeUI()
-    await ChatLoop(
+    await PrimaryAgent(
         manager,
         FakeClient(reasoning_chunks=("one", "two", "three")),
         ui,
@@ -271,10 +277,10 @@ async def test_chat_loop_announces_hidden_reasoning_only_once_per_turn() -> None
 
 
 @pytest.mark.asyncio
-async def test_chat_loop_streams_real_reasoning_when_enabled() -> None:
+async def test_primary_agent_streams_real_reasoning_when_enabled() -> None:
     manager = _manager()
     ui = FakeUI()
-    await ChatLoop(
+    await PrimaryAgent(
         manager,
         FakeClient(reasoning_chunks=("one", "two")),
         ui,
@@ -290,10 +296,10 @@ async def test_chat_loop_streams_real_reasoning_when_enabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_loop_rolls_back_failed_response_but_keeps_usage() -> None:
+async def test_primary_agent_rolls_back_failed_response_but_keeps_usage() -> None:
     manager = _manager()
     ui = FakeUI()
-    await ChatLoop(manager, FakeClient(True), ui, "system", 5).run_turn("hi")
+    await PrimaryAgent(manager, FakeClient(True), ui, "system", 5).run_turn("hi")
     assert manager.conversation and manager.conversation.messages == []
     summary = manager.conversation.usage_ledger.for_conversation()
     assert summary.usage.total_tokens == 3
@@ -302,10 +308,10 @@ async def test_chat_loop_rolls_back_failed_response_but_keeps_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_loop_recovers_after_failure_before_first_event() -> None:
+async def test_primary_agent_recovers_after_failure_before_first_event() -> None:
     manager = _manager()
     ui = FakeUI()
-    loop = ChatLoop(manager, FakeClient(fail_before_events=True), ui, "system", 5)
+    loop = PrimaryAgent(manager, FakeClient(fail_before_events=True), ui, "system", 5)
     await loop.run_turn("hi")
     assert manager.conversation and manager.conversation.messages == []
     summary = manager.conversation.usage_ledger.for_conversation()
@@ -323,7 +329,7 @@ async def test_cancelled_tool_batch_keeps_the_completed_exchange() -> None:
     manager = _manager()
     registry = ToolRegistry()
     registry.register(ReadFileTool())
-    loop = ChatLoop(
+    loop = PrimaryAgent(
         manager,
         ToolCallClient(),
         FakeUI(),
@@ -414,7 +420,7 @@ async def test_next_request_uses_new_context_snapshot_after_tool_execution() -> 
     registry.register(_DeferredTool())
     client = _TwoRequestClient()
     mcp = _McpState("# MCP\n\nOverall status: connecting\n")
-    loop = ChatLoop(
+    loop = PrimaryAgent(
         manager,
         client,
         FakeUI(),

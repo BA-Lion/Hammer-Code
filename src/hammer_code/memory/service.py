@@ -78,11 +78,14 @@ class MemoryService:
     ui: ConsolePort
     max_output_tokens: int
     executor: ToolExecutor | None = None
+    maintenance_lock: asyncio.Lock | None = None
 
     def __post_init__(self) -> None:
         self._task: asyncio.Task[bool] | None = None
         self._pending = False
+        self._accepting_schedules = True
         self._last_attempted_target = 0
+        self._maintenance_lock = self.maintenance_lock or asyncio.Lock()
 
     async def read_index_prompt(self) -> str:
         try:
@@ -101,29 +104,58 @@ class MemoryService:
             return ""
 
     def maybe_schedule(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._pending = True
+        if not self._accepting_schedules:
             return
-        self._task = asyncio.create_task(self._run(force=False))
+        self._pending = True
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._worker())
+
+    async def wait_idle(self) -> bool:
+        """Wait for the worker and work already queued without disabling scheduling."""
+
+        task = self._task
+        if task is None:
+            return True
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+
+    async def drain(self) -> bool:
+        """Stop accepting new work and finish the currently pending maintenance."""
+
+        self._accepting_schedules = False
+        return await self.wait_idle()
 
     async def flush_before_compaction(self) -> bool:
-        if self._task is not None:
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                return False
-        return await self._run(force=True)
+        if not await self.wait_idle():
+            return False
+        return await self._run_once(force=True)
 
     async def cancel(self) -> None:
+        self._accepting_schedules = False
+        self._pending = False
         if self._task is None or self._task.done():
             return
         self._task.cancel()
         try:
-            await self._task
+            await asyncio.shield(self._task)
         except asyncio.CancelledError:
             pass
 
-    async def _run(self, *, force: bool) -> bool:
+    async def _worker(self) -> bool:
+        result = True
+        while self._pending:
+            self._pending = False
+            result = await self._run_once(force=False) and result
+        return result
+
+    async def _run_once(self, *, force: bool) -> bool:
+        async with self._maintenance_lock:
+            return await self._run_once_locked(force=force)
+
+    async def _run_once_locked(self, *, force: bool) -> bool:
         stage = "session scan"
         try:
             restore = await asyncio.to_thread(self.coordinator.session.load)
@@ -162,11 +194,6 @@ class MemoryService:
                 f"Memory maintenance failed during {stage}; it will retry later."
             )
             return False
-        finally:
-            task = asyncio.current_task()
-            if self._pending and task is not None and not task.cancelled():
-                self._pending = False
-                self._task = asyncio.create_task(self._run(force=False))
 
     async def _extract_candidates(
         self, messages: tuple[Message, ...], cursor: int, target: int

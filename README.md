@@ -57,9 +57,21 @@ MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不�
 
 ## 交互
 
-启动后支持本地命令：`/help`、`/clear`、`/compact`、`/usage` 和 `/exit`。`/compact`
-只能在轮次之间执行：它复用自动压缩的管线，但不受自动阈值限制，成功后只展示估算
-节省量，不会发起普通模型请求。没有可压缩历史时会提示 `Nothing to compact.`。
+启动后，外层交互循环只处理输入、Slash Command 与 Session 生命周期；单个普通轮次由当前
+Primary Agent 执行。可用的本地命令可通过 `/help` 动态查看，包括：`/status`、`/usage`、
+`/clear`、`/compact`、`/permission`、`/session`、`/memory` 与 `/exit`（`/quit` 是 `/exit` 的
+别名）。命令不会进入对话历史或发送给模型。
+
+`/session list|new|resume <id|latest>|delete <id>` 只在同一启动 profile 和协议内切换；新
+Session 会立即成为当前会话，旧 Session 只在后台完成已经排队的 Memory 维护。删除会再次
+确认，且拒绝当前或 draining Session；删除不可恢复。`/memory list [category]` 与
+`/memory read <category> <relative-path>` 仅提供经校验的只读查看。
+
+`/clear` 先等待当前 Session 已有的 Memory 维护完成，再清空当前会话的历史、usage、MCP
+已发现工具、恢复线索和该 Session 的临时结果。`/compact` 只能在轮次之间执行；它保留唯一的
+强制 Memory flush 入口，并复用自动压缩管线。没有可压缩历史时会提示 `Nothing to compact.`。
+`/exit` 或 EOF 停止接收输入、排空已经启动或排队的 Memory 工作并持久化 Session；它不会因
+不足五轮而新建 Memory 提取。此期间再次 Ctrl+C 会取消剩余维护并快速收尾。
 
 上下文预算是本地 UTF-8 字节估算，不是供应商 usage。每次普通模型请求前都会检查预算；
 达到触发点时，系统只摘要已提交历史，当前 user 输入及当前工具轮次始终原样保留在最终请求尾部。
@@ -86,6 +98,9 @@ python -m uv build
 
 ## 当前范围
 
-已实现：统一消息/事件模型、内存会话事务、按 request 快照的 Token usage、严格配置与 endpoint 信任检查、三协议独立流式适配器、受权限控制的本地工具、MCP stdio/Streamable HTTP Client、延迟工具发现与不可变 ContextWindow，以及 Rich CLI。
+已实现：统一消息/事件模型、持久化本地 Session、项目指令与四类项目 Memory、按 request
+快照的 Token usage、严格配置与 endpoint 信任检查、三协议独立流式适配器、受权限控制的
+本地工具、MCP stdio/Streamable HTTP Client、延迟工具发现、上下文压缩、Primary Agent、
+运行中 Session 切换与 Rich CLI。
 
-未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、Memory、Skill、Subagent 和持久化会话。
+未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、Skill、Subagent、Agent Team 和跨 profile/protocol 的运行中切换。

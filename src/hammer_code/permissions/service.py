@@ -6,7 +6,12 @@ from typing import Protocol
 
 from hammer_code.errors import PermissionError
 from hammer_code.permissions.checker import PermissionChecker
-from hammer_code.permissions.models import ApprovalChoice, PermissionEffect, PermissionRequest
+from hammer_code.permissions.models import (
+    ApprovalChoice,
+    PermissionEffect,
+    PermissionMode,
+    PermissionRequest,
+)
 from hammer_code.permissions.rules import RuleStore
 
 
@@ -19,6 +24,13 @@ class PermissionService:
         self, checker: PermissionChecker, approvals: ApprovalPort, rules: RuleStore | None
     ) -> None:
         self.checker, self.approvals, self.rules = checker, approvals, rules
+
+    @property
+    def mode(self) -> PermissionMode:
+        return self.checker.mode
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        self.checker.mode = mode
 
     async def authorize(self, request: PermissionRequest) -> None:
         decision = self.checker.check(request)

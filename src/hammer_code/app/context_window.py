@@ -20,6 +20,11 @@ class ContextWindow:
     def __init__(self, base_system_prompt: str) -> None:
         self._base_system_prompt = base_system_prompt
 
+    def set_base_system_prompt(self, text: str) -> None:
+        if not text.strip():
+            raise ValueError("Base system prompt must not be empty")
+        self._base_system_prompt = text
+
     def snapshot(
         self,
         *,

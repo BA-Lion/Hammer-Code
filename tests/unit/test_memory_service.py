@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -293,6 +294,89 @@ async def test_memory_service_stops_after_bounded_merge_corrections(tmp_path: Pa
     assert len(client.requests) == 4
     assert coordinator.session.meta.memory_cursor == 0
     assert ui.warnings == ["Memory maintenance failed during candidate merge; it will retry later."]
+
+
+@pytest.mark.asyncio
+async def test_drain_consumes_existing_pending_work_but_rejects_later_scheduling(
+    tmp_path: Path,
+) -> None:
+    service, _, _ = _service(tmp_path, _MemoryClient())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[bool] = []
+
+    async def run_once(*, force: bool) -> bool:
+        calls.append(force)
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+        return True
+
+    service._run_once = run_once  # type: ignore[method-assign]
+    service.maybe_schedule()
+    await started.wait()
+    service.maybe_schedule()
+    draining = asyncio.create_task(service.drain())
+    release.set()
+
+    assert await draining
+    assert calls == [False, False]
+    service.maybe_schedule()
+    assert calls == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_shared_maintenance_lock_serializes_two_session_batches(tmp_path: Path) -> None:
+    shared_lock = asyncio.Lock()
+    first, _, _ = _service(tmp_path / "one", _MemoryClient())
+    second, _, _ = _service(tmp_path / "two", _MemoryClient())
+    first._maintenance_lock = shared_lock
+    second._maintenance_lock = shared_lock
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum = 0
+
+    async def blocked_once(*, force: bool) -> bool:
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        entered.set()
+        await release.wait()
+        active -= 1
+        return True
+
+    first._run_once_locked = blocked_once  # type: ignore[method-assign]
+    second._run_once_locked = blocked_once  # type: ignore[method-assign]
+    first_task = asyncio.create_task(first._run_once(force=False))
+    await entered.wait()
+    second_task = asyncio.create_task(second._run_once(force=False))
+    await asyncio.sleep(0)
+    assert maximum == 1
+    release.set()
+    assert await first_task
+    assert await second_task
+    assert maximum == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_worker_does_not_advance_memory_cursor(tmp_path: Path) -> None:
+    service, coordinator, _ = _service(tmp_path, _MemoryClient())
+    for index in range(1, 6):
+        await _append_turn(coordinator.manager, coordinator, index)
+    started = asyncio.Event()
+
+    async def blocked_candidates(*args: object) -> object:
+        started.set()
+        await asyncio.Event().wait()
+
+    service._extract_candidates = blocked_candidates  # type: ignore[method-assign]
+    service.maybe_schedule()
+    await started.wait()
+
+    await service.cancel()
+
+    assert coordinator.session.meta.memory_cursor == 0
 
 
 def test_merge_catalog_exposes_only_explicit_memory_read_paths(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import shutil
 from collections.abc import Callable
@@ -10,6 +11,8 @@ from pathlib import Path
 
 from hammer_code.session.models import SessionSummary
 from hammer_code.session.session import Session, SessionError
+
+_SESSION_ID = re.compile(r"\A\d{4}-\d{2}-\d{2}-\d{6}-[a-z0-9]{4}\Z")
 
 
 class SessionManager:
@@ -60,6 +63,16 @@ class SessionManager:
         if session.meta.protocol != protocol:
             raise SessionError("Session protocol does not match the selected profile")
         return session
+
+    def delete(self, session_id: str) -> None:
+        """Hard-delete one precisely identified, independently revalidated session."""
+        if not _SESSION_ID.fullmatch(session_id):
+            raise SessionError("Session id has an invalid format")
+        directory = self.sessions_root / f"session-{session_id}"
+        session = Session.open(self.sessions_root, directory)
+        if session.meta.id != session_id:
+            raise SessionError("Session identity does not match the requested id")
+        shutil.rmtree(session.directory)
 
     def cleanup(self) -> None:
         if not self.sessions_root.exists():

@@ -94,6 +94,11 @@ class ContextManager:
         self.max_output_tokens = max_output_tokens
         self.has_compacted = False
 
+    def set_base_system_prompt(self, text: str) -> None:
+        if not text.strip():
+            raise ValueError("Base system prompt must not be empty")
+        self.base_system_prompt = text
+
     @property
     def recovery_prompt(self) -> str:
         return build_recovery_prompt(self.recovery.entries()) if self.has_compacted else ""

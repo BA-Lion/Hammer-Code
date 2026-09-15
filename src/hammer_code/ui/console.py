@@ -35,6 +35,8 @@ class ConsolePort(Protocol):
     def persistence_warning(self, message: str, *, final: bool = False) -> None: ...
     def memory_warning(self, message: str) -> None: ...
     async def approve(self, request: PermissionRequest, reason: str) -> ApprovalChoice: ...
+    async def confirm(self, prompt: str) -> bool: ...
+    async def choose(self, prompt: str, options: tuple[str, ...]) -> str | None: ...
 
 
 class ConsoleUI:
@@ -154,6 +156,33 @@ class ConsoleUI:
                 case "3" | "":
                     return ApprovalChoice.DENY
             self.console.print("Enter 1, 2, or 3.")
+
+    async def confirm(self, prompt: str) -> bool:
+        self._begin_block()
+        try:
+            answer = await asyncio.to_thread(input, f"{prompt} [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer.strip().lower() in {"y", "yes"}
+
+    async def choose(self, prompt: str, options: tuple[str, ...]) -> str | None:
+        self._begin_block()
+        if not options:
+            return None
+        lines = "  ".join(f"{index + 1}) {option}" for index, option in enumerate(options))
+        while True:
+            try:
+                answer = await asyncio.to_thread(input, f"{prompt}\n{lines}\nSelect [1]: ")
+            except (EOFError, KeyboardInterrupt):
+                return None
+            normalized = answer.strip()
+            if not normalized:
+                return options[0]
+            if normalized.isdigit() and 1 <= int(normalized) <= len(options):
+                return options[int(normalized) - 1]
+            if normalized in options:
+                return normalized
+            self.console.print("Choose one of the listed options.")
 
     def error(self, message: str) -> None:
         self._begin_block()

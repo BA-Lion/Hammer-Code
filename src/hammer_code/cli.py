@@ -4,31 +4,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
 from hammer_code.app.chat_loop import ChatLoop
-from hammer_code.app.context_manager import ContextManager, RecoveryState
-from hammer_code.app.context_window import ContextWindow
-from hammer_code.app.token_estimator import TokenEstimator
+from hammer_code.app.commands import CommandRegistry, register_builtin_commands
+from hammer_code.app.runtime import PrimaryAgentFactory
 from hammer_code.config import EndpointTrustPolicy, discover_config, load_config, resolve_profile
-from hammer_code.conversation.manager import ConversationManager
 from hammer_code.errors import HammerCodeError
 from hammer_code.llm.factory import create_model_client
 from hammer_code.mcp.manager import McpManager
-from hammer_code.memory.service import MemoryService
 from hammer_code.memory.store import MemoryStore
 from hammer_code.permissions.checker import PermissionChecker
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.rules import RuleStore
 from hammer_code.permissions.service import PermissionService
 from hammer_code.project_instructions import ProjectInstructionLoader
-from hammer_code.prompts import PromptRuntimeContext, build_system_prompt
 from hammer_code.session.manager import SessionManager
-from hammer_code.session.session import SessionCoordinator
-from hammer_code.tools.base import ToolExecutionContext
 from hammer_code.tools.builtin import (
     CreateFileTool,
     EditFileTool,
@@ -38,10 +30,7 @@ from hammer_code.tools.builtin import (
     ShellTool,
     ToolSearchTool,
 )
-from hammer_code.tools.builtin.shell import sanitized_environment
-from hammer_code.tools.executor import ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
-from hammer_code.tools.runtime import RuntimeStore
 from hammer_code.ui.console import ConsoleUI
 
 
@@ -67,6 +56,8 @@ def parser() -> argparse.ArgumentParser:
 
 async def _run(args: argparse.Namespace) -> int:
     ui = ConsoleUI()
+    client = None
+    mcp_manager = None
     try:
         path = discover_config(args.config)
         config = load_config(path)
@@ -74,7 +65,7 @@ async def _run(args: argparse.Namespace) -> int:
         sessions = SessionManager(workspace_root)
         await asyncio.to_thread(sessions.cleanup)
         if getattr(args, "list_sessions", False):
-            ui.sessions(sessions.list())
+            ui.sessions(await asyncio.to_thread(sessions.list))
             return 0
         profile_name = args.profile or config.default_profile
         profile = config.profiles.get(profile_name)
@@ -87,27 +78,6 @@ async def _run(args: argparse.Namespace) -> int:
         ):
             raise HammerCodeError("Unattended mode was not confirmed")
         resolved = resolve_profile(config, args.profile)
-        project_instructions = ProjectInstructionLoader(workspace_root).load()
-        runtime = RuntimeStore(workspace_root)
-        runtime.cleanup_old()
-        estimator = TokenEstimator()
-        recovery = RecoveryState(config.context)
-        manager = ConversationManager()
-        resume_id = getattr(args, "resume", None)
-        session = sessions.open(resume_id, resolved.profile.protocol) if resume_id else None
-        stale_restore = False
-        if session is not None:
-            old_last_active = session.meta.last_active
-            restored = session.load()
-            stale_restore = (datetime.now(UTC) - old_last_active.astimezone(UTC)) > timedelta(
-                hours=24
-            )
-            manager.restore(resolved, restored.messages, session.meta.total_tokens)
-            session.touch()
-            coordinator = SessionCoordinator.restored(session, manager, restored)
-        else:
-            manager.create(resolved)
-            coordinator = SessionCoordinator(sessions.create(resolved.profile.protocol), manager)
         registry = ToolRegistry(config.tools.disabled)
         for tool in (
             ReadFileTool(),
@@ -120,46 +90,51 @@ async def _run(args: argparse.Namespace) -> int:
             registry.register(tool)
         rules = RuleStore(workspace_root)
         permissions = PermissionService(PermissionChecker(mode, rules), ui, rules)
-        context = ToolExecutionContext(
-            workspace_root, Path.cwd().resolve(), runtime.session_dir, sanitized_environment()
-        )
+        client = create_model_client(resolved)
         mcp_manager = McpManager(config.mcp, registry, workspace_root, ui=ui)
         registry.register(ToolSearchTool(registry, mcp_manager))
-        system_prompt = build_system_prompt(
-            PromptRuntimeContext(
-                cwd=Path.cwd().resolve(),
-                project_root=workspace_root,
-                platform=sys.platform,
-                shell_backend="PowerShell",
-                permission_mode=mode.value,
-                enabled_tools=registry.exposed_names(),
-            )
+        factory = PrimaryAgentFactory(
+            workspace_root=workspace_root,
+            cwd=Path.cwd(),
+            config=config,
+            resolved=resolved,
+            client=client,
+            ui=ui,
+            registry=registry,
+            mcp_manager=mcp_manager,
+            permissions=permissions,
+            sessions=sessions,
+            memory_store=MemoryStore(workspace_root),
+            maintenance_lock=asyncio.Lock(),
+            project_instructions=ProjectInstructionLoader(workspace_root).load(),
+            show_reasoning=config.ui.show_reasoning,
         )
-        context_window = ContextWindow(system_prompt)
-        client = create_model_client(resolved)
-        context_manager = ContextManager(
-            manager,
-            client,
-            runtime,
-            config.context,
-            estimator,
-            recovery,
-            system_prompt,
-            resolved.profile.max_output_tokens,
-        )
-        executor = ToolExecutor(
-            registry,
-            permissions,
-            context,
-            runtime,
-            config.context,
-            estimator,
-            context_manager.observe_tool_result,
-        )
+        resume_id = getattr(args, "resume", None)
+        current = await (factory.resume(resume_id) if resume_id else factory.create_new())
     except HammerCodeError as exc:
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         ui.error(str(exc))
         return 2
     except OSError:
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.close()
+            except Exception:
+                pass
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         ui.error("Unable to resolve the project runtime paths.")
         return 2
     ui.banner(
@@ -168,44 +143,18 @@ async def _run(args: argparse.Namespace) -> int:
         resolved.profile.model,
         urlparse(resolved.profile.base_url).netloc,
     )
+    commands = CommandRegistry()
+    register_builtin_commands(commands)
     try:
         mcp_manager.start()
-        memory_service = MemoryService(
-            client,
-            MemoryStore(workspace_root),
-            coordinator,
-            ui,
-            resolved.profile.max_output_tokens,
-            executor,
-        )
-        await ChatLoop(
-            manager,
-            client,
-            ui,
-            system_prompt,
-            resolved.profile.max_output_tokens,
-            config.ui.show_reasoning,
-            registry,
-            executor,
-            context_window,
-            mcp_manager,
-            context_manager,
-            coordinator,
-            memory_service,
-            project_instructions,
-            stale_restore,
-        ).run()
+        await ChatLoop(current, factory, commands, sessions, factory.memory_store, ui).run()
     finally:
         try:
             await mcp_manager.close()
         finally:
-            try:
-                await client.aclose()
-            finally:
-                runtime.cleanup()
+            await client.aclose()
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
-    return asyncio.run(_run(args))
+    return asyncio.run(_run(parser().parse_args(argv)))
