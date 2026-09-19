@@ -52,6 +52,9 @@ uv run hammer-code --help
 | --- | --- |
 | `--config PATH` | 明确指定 TOML 配置文件路径。路径不存在时直接报错。 |
 | `--profile NAME` | 覆盖配置中的 `default_profile`，选择指定 profile。 |
+| `--permission-mode MODE` | 以 `default`、`accept_edits`、`strict` 或 `unattended` 启动权限模式。`unattended` 仍要求启动确认。 |
+| `--resume ID_OR_LATEST` | 恢复与当前 profile/协议兼容的本地 Session。 |
+| `--list-sessions` | 列出有效 Session 后退出；不初始化模型客户端、MCP 或 Skill。 |
 | `-h` / `--help` | 显示命令帮助并退出。 |
 
 ## 启动对话
@@ -112,9 +115,15 @@ thinking_budget = 1024
 | `/help` | 显示内置命令说明。 |
 | `/usage` | 显示当前会话中供应商报告的 Token usage；缺失数据会显示为 `unavailable`，不会伪造为 0。 |
 | `/clear` | 清除当前进程内的消息历史与 usage，不会删除任何文件。 |
+| `/compact` | 请求在下一次模型调用前压缩当前上下文。 |
+| `/permission [mode]` | 切换为 `default`、`accept_edits`、`strict` 或 `unattended`；后者需要确认。 |
+| `/session list|new|resume|delete` | 管理同一 profile/协议下的本地 Session。 |
+| `/memory list|read` | 只读查看项目 Memory 目录与已索引主题。 |
+| `/skill <name|scope:name> [arguments]` | 运行一个本地 Skill；可用 `project:name` 或 `user:name` 精确指定被遮蔽的版本。 |
+| `/feedback <name|scope:name> <feedback>` | 对指定 Skill 提交维护反馈；仅 Evolution 启用且权限允许自动写入时可用。 |
 | `/exit` | 关闭客户端并退出。 |
 
-空输入会被忽略。当前版本不会执行 Tool Call、命令或文件修改；模型输出的 Tool Call 仅会被解析并提示，绝不执行。
+空输入会被忽略。普通模型 Tool Call 会先经过本地参数校验、路径/命令策略和 PermissionService；未公开、已禁用、无效或未获授权的调用不会执行。`/skill`、`/feedback` 与模型 `use_skill` 的完整说明见 [Skill 使用指南](skills.md)。
 
 ## 开发验证与构建
 
@@ -138,3 +147,5 @@ that boundary if it must be retained.
 Project-local `hammer-code.md` may provide instructions and bounded relative `@include(...)` files.
 Memory and project instructions are non-authoritative context: they never grant tool permissions or
 override current user instructions and verified workspace facts.
+
+Session 切换和退出会先 drain 已排队的后台维护任务；再次中断时会取消尚未提交的维护。Session JSONL 不保存 Skill 候选、自动加载正文或 Evolution 中间输出。

@@ -14,6 +14,18 @@ INLINE_LINES = 1000
 CAPTURE_BYTES = 10 * 1024 * 1024
 
 
+def fits_inline_result(
+    content: str, config: ContextConfig, estimator: TokenEstimator | None = None
+) -> bool:
+    """Whether a Skill body can be returned without the normal truncation path."""
+    token_estimator = estimator or TokenEstimator()
+    return (
+        token_estimator.estimate_text(content) <= config.tool_result_overflow_tokens
+        and len(content.encode("utf-8")) <= INLINE_BYTES
+        and len(content.splitlines()) <= INLINE_LINES
+    )
+
+
 @dataclass(frozen=True)
 class BoundedResult:
     content: str
@@ -64,11 +76,7 @@ def bound_result(
     config = context_config or ContextConfig()
     token_estimator = estimator or TokenEstimator()
     normalized = content or "(empty output)"
-    if (
-        token_estimator.estimate_text(normalized) <= config.tool_result_overflow_tokens
-        and len(normalized.encode("utf-8")) <= INLINE_BYTES
-        and len(normalized.splitlines()) <= INLINE_LINES
-    ):
+    if fits_inline_result(normalized, config, token_estimator):
         return BoundedResult(normalized, False)
     return BoundedResult(
         _preview(normalized, call_id, runtime, config.tool_result_preview_tokens, token_estimator),

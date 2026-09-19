@@ -7,6 +7,29 @@ show_reasoning = false
 # Disabled tools only reduce the built-in capability set.
 disabled = []
 
+# Skills are discovered below .hammer-code/skill/{project,user}/. Evolution is
+# opt-in and writes only in accept_edits or unattended permission modes.
+[skill]
+enabled = true
+retrieval_top_k = 3
+retrieval_relative_floor = 0.60
+retrieval_query_coverage = 0.20
+
+[skill.evolution]
+enabled = true
+max_history_messages = 8
+max_input_tokens = 4000
+max_maintenance_input_tokens = 64000
+merge_candidate_top_k = 10
+forced_merge_score = 0.90
+forced_merge_margin = 0.10
+max_body_chars = 32000
+max_corrections = 2
+prune_unused_days = 90
+prune_min_retrieve = 20
+prune_min_relevant = 10
+prune_relevant_used_ratio = 5.0
+
 # Local context-budget estimates, not provider-reported token usage.
 [context]
 tool_result_overflow_tokens = 5000

@@ -28,6 +28,35 @@ max_retries = 0
 
 `default_profile` 必须引用已有的 `[profiles.<名称>]`。profile 名称不可为空。
 
+## Skill 与自进化
+
+Skill 相关目录位于项目内 `.hammer-code/skill/`，并被 Git 忽略。省略 `[skill]` 时，代码默认启用本地 Skill 发现/调用、但默认关闭 Evolution；不存在 Skill 目录等同于空 catalog，不会在启动时自动创建第一个 Skill。
+
+```toml
+[skill]
+enabled = true                 # false 会关闭模型、/skill 本地调用和候选检索
+retrieval_top_k = 3            # 1–20；每轮最多展示的 metadata 候选数
+retrieval_relative_floor = 0.60
+retrieval_query_coverage = 0.20
+
+[skill.evolution]
+enabled = false                # 建议先保持关闭；启用后才允许后台提炼/维护
+max_history_messages = 8
+max_input_tokens = 4000
+max_maintenance_input_tokens = 64000
+merge_candidate_top_k = 10
+forced_merge_score = 0.90
+forced_merge_margin = 0.10
+max_body_chars = 32000
+max_corrections = 2
+prune_unused_days = 90
+prune_min_retrieve = 20
+prune_min_relevant = 10
+prune_relevant_used_ratio = 5.0
+```
+
+Evolution 还要求运行时权限为 `accept_edits` 或 `unattended`；`default` 和 `strict` 不会排队后台写入，也不会显示后台审批。请以 `.hammer-code/config.example.toml` 的实际 `enabled` 值为复制配置后的最终准则：该示例可被项目维护者调整，而代码默认值仍为 `false`。完整目录、调用和恢复说明见 [Skill 使用指南](skills.md)。
+
 ## 通用 profile 字段
 
 | 字段 | 必填 | 说明 |

@@ -120,28 +120,31 @@ class ContextManager:
         *,
         current_suffix: tuple[Message, ...],
         mcp_prompt: str,
+        skill_prompt: str = "",
         tools: tuple[ToolDefinition, ...],
         before_compaction: Callable[[], Awaitable[object]] | None = None,
     ) -> ContextPreparation:
         self._trim_stale_tool_results()
         before = self._estimate(
-            self.manager.snapshot_committed(), current_suffix, mcp_prompt, tools
+            self.manager.snapshot_committed(), current_suffix, mcp_prompt, skill_prompt, tools
         )
         if before < self.config.compact_trigger_tokens:
             return ContextPreparation()
         if before_compaction is not None:
             await before_compaction()
-        return await self._compact(current_suffix, mcp_prompt, tools, before, manual=False)
+        return await self._compact(
+            current_suffix, mcp_prompt, skill_prompt, tools, before, manual=False
+        )
 
     async def compact_now(
-        self, *, mcp_prompt: str, tools: tuple[ToolDefinition, ...]
+        self, *, mcp_prompt: str, skill_prompt: str = "", tools: tuple[ToolDefinition, ...]
     ) -> ContextPreparation:
         self._trim_stale_tool_results()
         committed = self.manager.snapshot_committed()
         if len(self._split_turns(committed)) < 3:
             return ContextPreparation()
-        before = self._estimate(committed, (), mcp_prompt, tools)
-        return await self._compact((), mcp_prompt, tools, before, manual=True)
+        before = self._estimate(committed, (), mcp_prompt, skill_prompt, tools)
+        return await self._compact((), mcp_prompt, skill_prompt, tools, before, manual=True)
 
     def clear(self) -> bool:
         self.has_compacted = False
@@ -153,11 +156,12 @@ class ContextManager:
         committed: tuple[Message, ...],
         suffix: tuple[Message, ...],
         mcp_prompt: str,
+        skill_prompt: str,
         tools: tuple[ToolDefinition, ...],
     ) -> int:
         system = "\n\n".join(
             piece.strip()
-            for piece in (self.base_system_prompt, mcp_prompt, self.recovery_prompt)
+            for piece in (self.base_system_prompt, mcp_prompt, skill_prompt, self.recovery_prompt)
             if piece.strip()
         )
         return self.estimator.estimate_request(system, committed + suffix, tools)
@@ -209,6 +213,7 @@ class ContextManager:
         self,
         suffix: tuple[Message, ...],
         mcp_prompt: str,
+        skill_prompt: str,
         tools: tuple[ToolDefinition, ...],
         before: int,
         manual: bool,
@@ -237,7 +242,7 @@ class ContextManager:
                 replacement = tuple((*first, summary_message, boundary, *last))
                 was_compacted = self.has_compacted
                 self.has_compacted = True
-                after = self._estimate(replacement, suffix, mcp_prompt, tools)
+                after = self._estimate(replacement, suffix, mcp_prompt, skill_prompt, tools)
                 if (manual and after >= before) or (
                     not manual and after >= self.config.compact_trigger_tokens
                 ):

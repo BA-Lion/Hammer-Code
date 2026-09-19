@@ -59,7 +59,7 @@ MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不�
 
 启动后，外层交互循环只处理输入、Slash Command 与 Session 生命周期；单个普通轮次由当前
 Primary Agent 执行。可用的本地命令可通过 `/help` 动态查看，包括：`/status`、`/usage`、
-`/clear`、`/compact`、`/permission`、`/session`、`/memory` 与 `/exit`（`/quit` 是 `/exit` 的
+`/clear`、`/compact`、`/permission`、`/session`、`/memory`、`/skill`、`/feedback` 与 `/exit`（`/quit` 是 `/exit` 的
 别名）。命令不会进入对话历史或发送给模型。
 
 `/session list|new|resume <id|latest>|delete <id>` 只在同一启动 profile 和协议内切换；新
@@ -78,6 +78,19 @@ Session 会立即成为当前会话，旧 Session 只在后台完成已经排队
 摘要失败最多重试三次，之后保留会话并安全报错，不会自动清空历史。超大工具结果的临时
 捕获位于 `.hammer-code/tmp/<session-id>/tool-results/`，可在成功摘要后定向清理；`/clear`
 会同时清除内存历史、usage、MCP 已发现工具、恢复线索和当前会话临时结果。
+
+### Skill
+
+Skill 默认从项目内 `.hammer-code/skill/project/<folder>/SKILL.md` 与
+`.hammer-code/skill/user/<folder>/SKILL.md` 的直接子目录发现。project 同名 Skill 遮蔽 user
+版本；模型只看到候选元数据，必须调用 `use_skill` 才会加载完整正文。`/skill <name> [arguments]`
+使用相同的受限解析与渲染规则，`/feedback <name|scope:name> <feedback>` 提交对特定 Skill 的
+维护反馈。Skill 不能授予工具权限，所有实际调用继续经过既有权限服务。
+
+`[skill.evolution]` 默认关闭。开启后，只有 `accept_edits` 或 `unattended` 权限模式允许后台维护
+候选；当前目录中的 Skill state、history 与恢复 journal 均为本地数据，已被 Git 忽略。不要在
+Skill 或配置中保存凭证。关闭 evolution 或切换至 `default`/`strict` 会阻止新的自动写入；恢复时
+保留 history/prune 目录，先备份当前目标再手工恢复完整目录，代码回滚也不应删除这些本地数据。
 
 ```powershell
 python -m uv run python -m hammer_code --help
@@ -103,4 +116,5 @@ python -m uv build
 本地工具、MCP stdio/Streamable HTTP Client、延迟工具发现、上下文压缩、Primary Agent、
 运行中 Session 切换与 Rich CLI。
 
-未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、Skill、Subagent、Agent Team 和跨 profile/protocol 的运行中切换。
+未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、
+通用 Subagent、Agent Team 和跨 profile/protocol 的运行中切换。

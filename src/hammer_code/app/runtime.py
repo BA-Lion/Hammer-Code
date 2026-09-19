@@ -23,6 +23,9 @@ from hammer_code.prompts import PromptRuntimeContext, build_system_prompt
 from hammer_code.session.manager import SessionManager
 from hammer_code.session.models import RestoreResult
 from hammer_code.session.session import Session, SessionCoordinator
+from hammer_code.skill.evolution import SkillEvolutionService
+from hammer_code.skill.repository import SkillRepository
+from hammer_code.skill.service import SkillInvocationService
 from hammer_code.tools.base import ToolExecutionContext
 from hammer_code.tools.builtin.shell import sanitized_environment
 from hammer_code.tools.executor import ToolExecutor
@@ -55,6 +58,7 @@ class PrimaryAgentFactory:
         sessions: SessionManager,
         memory_store: MemoryStore,
         maintenance_lock: asyncio.Lock,
+        skill_repository: SkillRepository | None = None,
         project_instructions: str = "",
         show_reasoning: bool = False,
     ) -> None:
@@ -70,6 +74,7 @@ class PrimaryAgentFactory:
         self.sessions = sessions
         self.memory_store = memory_store
         self.maintenance_lock = maintenance_lock
+        self.skill_repository = skill_repository
         self.project_instructions = project_instructions
         self.show_reasoning = show_reasoning
         self._cleanup_old_done = False
@@ -121,11 +126,17 @@ class PrimaryAgentFactory:
             prompt,
             self.resolved.profile.max_output_tokens,
         )
+        skill_service = (
+            SkillInvocationService(self.skill_repository, self.config.skill, self.config.context)
+            if self.skill_repository is not None
+            else None
+        )
         execution_context = ToolExecutionContext(
             self.workspace_root,
             self.cwd,
             runtime.session_dir,
             sanitized_environment(),
+            skill_service,
         )
         executor = ToolExecutor(
             self.registry,
@@ -136,6 +147,17 @@ class PrimaryAgentFactory:
             TokenEstimator(),
             context_manager.observe_tool_result,
         )
+        if skill_service is not None:
+            skill_service.bind_fork_runtime(
+                client=self.client,
+                executor=executor,
+                registry=self.registry,
+                system_prompt=prompt,
+                project_instructions=self.project_instructions,
+                mcp_prompt=self.mcp_manager.prompt,
+                max_output_tokens=self.resolved.profile.max_output_tokens,
+                record_usage=manager.record_maintenance_usage,
+            )
         memory = MemoryService(
             self.client,
             self.memory_store,
@@ -144,6 +166,19 @@ class PrimaryAgentFactory:
             self.resolved.profile.max_output_tokens,
             executor,
             maintenance_lock=self.maintenance_lock,
+        )
+        evolution = (
+            SkillEvolutionService(
+                self.client,
+                self.skill_repository,
+                self.permissions,
+                manager,
+                self.config.skill,
+                self.resolved.profile.max_output_tokens,
+                self.registry.exposed_names(),
+            )
+            if self.skill_repository is not None
+            else None
         )
         return PrimaryAgent(
             manager,
@@ -164,6 +199,8 @@ class PrimaryAgentFactory:
             self.permissions,
             self._prompt,
             runtime,
+            skill_service,
+            evolution,
         )
 
     def _prompt(self, mode: object) -> str:

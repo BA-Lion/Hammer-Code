@@ -99,6 +99,16 @@ class ToolRegistry:
     def exposed_names(self) -> tuple[str, ...]:
         return tuple(definition.name for definition in self.definitions())
 
+    def restricted_view(self, allowed: set[str] | None = None) -> ToolRegistry:
+        """Freeze the currently exposed subset for a constrained child execution."""
+        view = ToolRegistry()
+        names = set(self.exposed_names())
+        if allowed is not None:
+            names.intersection_update(allowed)
+        for name in sorted(names):
+            view.register(self._tools[name])
+        return view
+
     @staticmethod
     def _validate_tool(tool: Tool) -> None:
         if not tool.name:

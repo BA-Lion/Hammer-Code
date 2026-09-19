@@ -190,6 +190,12 @@ def register_builtin_commands(registry: CommandRegistry) -> None:
         Command("session", "Manage sessions", "/session list|new|resume|delete", _session)
     )
     registry.register(Command("memory", "Read project memory", "/memory list|read", _memory))
+    registry.register(
+        Command("skill", "Run a local Skill", "/skill <name|scope:name> [arguments]", _skill)
+    )
+    registry.register(
+        Command("feedback", "Improve a Skill", "/feedback <name|scope:name> <feedback>", _feedback)
+    )
     registry.register(Command("exit", "Exit Hammer Code", "/exit", _exit, aliases=("quit",)))
 
 
@@ -322,6 +328,22 @@ async def _memory(context: CommandContext, invocation: CommandInvocation) -> Com
         context.ui.info(_bounded_memory_text(text))
         return CommandOutcome()
     raise CommandError("Usage: /memory list [category] | /memory read <category> <relative-path>")
+
+
+async def _skill(context: CommandContext, invocation: CommandInvocation) -> CommandOutcome:
+    parts = invocation.arguments.split(maxsplit=1)
+    if not parts:
+        raise CommandError("Usage: /skill <name|scope:name> [arguments]")
+    await context.agent.run_skill(parts[0], parts[1] if len(parts) == 2 else "")
+    return CommandOutcome()
+
+
+async def _feedback(context: CommandContext, invocation: CommandInvocation) -> CommandOutcome:
+    parts = invocation.arguments.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        raise CommandError("Usage: /feedback <name|scope:name> <feedback>")
+    await context.agent.feedback_skill(parts[0], parts[1])
+    return CommandOutcome()
 
 
 async def _exit(context: CommandContext, invocation: CommandInvocation) -> CommandOutcome:

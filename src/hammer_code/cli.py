@@ -21,6 +21,8 @@ from hammer_code.permissions.rules import RuleStore
 from hammer_code.permissions.service import PermissionService
 from hammer_code.project_instructions import ProjectInstructionLoader
 from hammer_code.session.manager import SessionManager
+from hammer_code.skill.repository import SkillRepository
+from hammer_code.skill.tool import UseSkillTool
 from hammer_code.tools.builtin import (
     CreateFileTool,
     EditFileTool,
@@ -86,6 +88,7 @@ async def _run(args: argparse.Namespace) -> int:
             GrepTool(),
             GlobTool(),
             ShellTool(),
+            UseSkillTool(),
         ):
             registry.register(tool)
         rules = RuleStore(workspace_root)
@@ -93,6 +96,12 @@ async def _run(args: argparse.Namespace) -> int:
         client = create_model_client(resolved)
         mcp_manager = McpManager(config.mcp, registry, workspace_root, ui=ui)
         registry.register(ToolSearchTool(registry, mcp_manager))
+        skill_repository = SkillRepository(workspace_root)
+        try:
+            await skill_repository.initialize()
+        except Exception:
+            ui.error("Skill storage is unavailable; continuing without Skill support.")
+            skill_repository = None
         factory = PrimaryAgentFactory(
             workspace_root=workspace_root,
             cwd=Path.cwd(),
@@ -106,6 +115,7 @@ async def _run(args: argparse.Namespace) -> int:
             sessions=sessions,
             memory_store=MemoryStore(workspace_root),
             maintenance_lock=asyncio.Lock(),
+            skill_repository=skill_repository,
             project_instructions=ProjectInstructionLoader(workspace_root).load(),
             show_reasoning=config.ui.show_reasoning,
         )

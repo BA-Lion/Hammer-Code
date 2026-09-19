@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import BaseModel
 
@@ -24,12 +25,19 @@ class ConcurrencyPolicy(StrEnum):
     SERIAL = "serial"
 
 
+class SkillInvocationPort(Protocol):
+    """Per-Agent bridge used by the built-in ``use_skill`` tool only."""
+
+    async def invoke(self, name: str, arguments: str) -> ToolExecutionResult: ...
+
+
 @dataclass(frozen=True)
 class ToolExecutionContext:
     workspace_root: Path
     cwd: Path
     runtime_dir: Path
     sanitized_env: Mapping[str, str]
+    skill_invoker: SkillInvocationPort | None = None
 
 
 @dataclass(frozen=True)

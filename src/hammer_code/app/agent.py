@@ -30,6 +30,11 @@ from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
 from hammer_code.prompts import build_stale_restore_prompt
 from hammer_code.session.session import SessionCoordinator
+from hammer_code.skill.evolution import SkillEvolutionService
+from hammer_code.skill.models import SkillObservation
+from hammer_code.skill.prompts import build_skill_request_prompt
+from hammer_code.skill.repository import SkillRepositoryError
+from hammer_code.skill.service import SkillInvocationService
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.tools.runtime import RuntimeStore
@@ -76,6 +81,8 @@ class PrimaryAgent:
         permissions: PermissionService | None = None,
         prompt_builder: Callable[[PermissionMode], str] | None = None,
         runtime: RuntimeStore | None = None,
+        skill_service: SkillInvocationService | None = None,
+        skill_evolution: SkillEvolutionService | None = None,
     ) -> None:
         (
             self.manager,
@@ -96,6 +103,8 @@ class PrimaryAgent:
             self.permissions,
             self._prompt_builder,
             self.runtime,
+            self.skill_service,
+            self.skill_evolution,
         ) = (
             manager,
             client,
@@ -115,10 +124,13 @@ class PrimaryAgent:
             permissions,
             prompt_builder,
             runtime,
+            skill_service,
+            skill_evolution,
         )
         self._accepting_turns = True
         self._closed = False
         self._finalization_lock = asyncio.Lock()
+        self._previous_skill_observation: SkillObservation | None = None
 
     @property
     def session_id(self) -> str:
@@ -145,6 +157,8 @@ class PrimaryAgent:
         )
 
     async def clear(self) -> None:
+        if self.skill_evolution is not None:
+            await self.skill_evolution.wait_idle()
         if self.memory_service is not None:
             await self.memory_service.wait_idle()
         self.manager.clear()
@@ -202,14 +216,84 @@ class PrimaryAgent:
         self._accepting_turns = False
         await self._finish(cancel_memory=True)
 
-    async def run_turn(self, text: str) -> None:
+    async def run_skill(self, name: str, arguments: str) -> None:
+        """Run a local inline Skill as an ordinary durable turn."""
+        if self.skill_service is None:
+            raise HammerCodeError("Skill invocation is unavailable")
+        await self.run_turn(
+            f"/skill {name}{(' ' + arguments) if arguments else ''}", skill=(name, arguments)
+        )
+
+    async def feedback_skill(self, name: str, feedback: str) -> None:
+        if self.skill_evolution is None:
+            raise HammerCodeError("Skill feedback is unavailable")
+        await self.skill_evolution.feedback(name, feedback)
+        self.ui.info("Skill feedback queued for controlled maintenance.")
+
+    async def run_turn(self, text: str, skill: tuple[str, str] | None = None) -> None:
         if not self._accepting_turns:
             raise HammerCodeError("Agent is draining and cannot accept another turn")
         turn = None
         request_count = 0
         call_count = 0
         unknown_count = 0
+        skill_prompt = ""
+        skill_started = False
         try:
+            if self.skill_service is not None:
+                try:
+                    skill_snapshot = await self.skill_service.repository.snapshot_for_turn()
+                    if skill is None:
+                        index = skill_snapshot.index
+                        retrieved = (
+                            index.retrieve(
+                                text,
+                                skill_snapshot.effective.values(),
+                                top_k=self.skill_service.skill_config.retrieval_top_k,
+                                relative_floor=self.skill_service.skill_config.retrieval_relative_floor,
+                                coverage_floor=self.skill_service.skill_config.retrieval_query_coverage,
+                            )
+                            if self.skill_service.skill_config.enabled and index is not None
+                            else ()
+                        )
+                        if retrieved:
+                            await self.skill_service.repository.record_retrieved(
+                                tuple(item.ref for item in retrieved)
+                            )
+                        skill_prompt = build_skill_request_prompt(skill_snapshot, retrieved)
+                    else:
+                        retrieved = ()
+                    self.skill_service.begin_turn(
+                        skill_snapshot, SkillObservation(skill_snapshot.generation, retrieved)
+                    )
+                    skill_started = True
+                    if self.skill_evolution is not None and skill is None:
+                        self.skill_evolution.schedule(
+                            self.manager.snapshot_committed(),
+                            text,
+                            self._previous_skill_observation,
+                        )
+                    if skill is not None:
+                        prepared = await self.skill_service.invoke_user(*skill)
+                        if prepared.is_fork:
+                            result = await self.skill_service.invoke_prepared_fork(
+                                prepared, skill[1]
+                            )
+                            turn = self.manager.begin_turn(text)
+                            if result.is_error:
+                                self.ui.error(result.content.removeprefix("Error: ").strip())
+                                committed = self.manager.interrupt(turn)
+                                await self._persist_turn_outcome(committed, completed=False)
+                            else:
+                                self.ui.text_delta(result.content)
+                                committed = self.manager.commit(
+                                    turn, Message(Role.ASSISTANT, (TextBlock(result.content),))
+                                )
+                                await self._persist_turn_outcome(committed, completed=True)
+                            return
+                        skill_prompt = prepared.prompt
+                except SkillRepositoryError:
+                    self.ui.error("Skill catalog is unavailable for this turn.")
             if self.context_manager is not None:
                 pending = Message(Role.USER, (TextBlock(text),))
                 prompt, tools = self._sample_context()
@@ -217,6 +301,7 @@ class PrimaryAgent:
                 preparation = await self.context_manager.prepare_before_request(
                     current_suffix=(pending,),
                     mcp_prompt=prompt,
+                    skill_prompt=skill_prompt,
                     tools=tools,
                     before_compaction=(
                         self.memory_service.flush_before_compaction
@@ -239,6 +324,7 @@ class PrimaryAgent:
                     preparation = await self.context_manager.prepare_before_request(
                         current_suffix=self.manager.snapshot_staged(turn),
                         mcp_prompt=prompt,
+                        skill_prompt=skill_prompt,
                         tools=tools,
                         before_compaction=(
                             self.memory_service.flush_before_compaction
@@ -256,6 +342,7 @@ class PrimaryAgent:
                 snapshot = self.context_window.snapshot(
                     mcp_prompt=prompt,
                     project_instructions=self.project_instructions,
+                    skill_prompt=skill_prompt,
                     memory_prompt=memory_prompt,
                     stale_prompt=build_stale_restore_prompt() if self.stale_restore else "",
                     recovery_prompt=self.context_manager.recovery_prompt
@@ -350,6 +437,12 @@ class PrimaryAgent:
                 str(exc) if isinstance(exc, HammerCodeError) else "Unexpected model failure"
             )
         finally:
+            if skill_started and self.skill_service is not None:
+                observation = self.skill_service.end_turn(
+                    completed=turn is not None and turn.status.value == "committed"
+                )
+                if observation is not None and observation.completed:
+                    self._previous_skill_observation = observation
             if self.manager.conversation and turn is not None:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_turn(turn.id))
 
@@ -362,6 +455,11 @@ class PrimaryAgent:
                     await self.memory_service.cancel()
                 else:
                     await self.memory_service.drain()
+            if self.skill_evolution is not None:
+                if cancel_memory:
+                    await self.skill_evolution.cancel()
+                else:
+                    await self.skill_evolution.drain()
             if self.session_coordinator is not None:
                 await self.session_coordinator.close()
             if self.runtime is not None:

@@ -204,3 +204,13 @@ def test_mcp_http_bearer_environment_reference_is_retained_without_resolving() -
         bearer_token_env="EXAMPLE_MCP_TOKEN",
     )
     assert config.bearer_token_env == "EXAMPLE_MCP_TOKEN"
+
+
+def test_skill_evolution_config_is_opt_in_and_validates_prune_and_merge_relationships() -> None:
+    from hammer_code.config import SkillEvolutionConfig
+
+    assert not SkillEvolutionConfig().enabled
+    with pytest.raises(ValueError):
+        SkillEvolutionConfig(forced_merge_score=0.5, forced_merge_margin=0.5)
+    with pytest.raises(ValueError):
+        SkillEvolutionConfig(prune_min_retrieve=5, prune_min_relevant=6)

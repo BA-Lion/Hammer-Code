@@ -14,4 +14,5 @@ build/
 .hammer-code/tmp/
 /.hammer-code/sessions/
 /.hammer-code/memory/
+/.hammer-code/skill/
 Trial/

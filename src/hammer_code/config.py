@@ -23,7 +23,15 @@ from pydantic import (
 from hammer_code.errors import ConfigurationError, UntrustedEndpointError
 
 ProtocolName = Literal["openai_responses", "openai_chat_completions", "anthropic_messages"]
-BUILTIN_TOOL_NAMES = {"read_file", "edit_file", "create_file", "grep", "glob", "shell"}
+BUILTIN_TOOL_NAMES = {
+    "read_file",
+    "edit_file",
+    "create_file",
+    "grep",
+    "glob",
+    "shell",
+    "use_skill",
+}
 McpTransport = Literal["stdio", "streamable_http"]
 _MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -141,6 +149,42 @@ class ContextConfig(BaseModel):
         return self
 
 
+class SkillEvolutionConfig(BaseModel):
+    """Bounded controls for the opt-in, local Skill maintenance worker."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    enabled: bool = False
+    max_history_messages: int = Field(default=8, ge=0, le=64)
+    max_input_tokens: int = Field(default=4000, gt=0)
+    max_maintenance_input_tokens: int = Field(default=64000, gt=0)
+    merge_candidate_top_k: int = Field(default=10, ge=1, le=50)
+    forced_merge_score: float = Field(default=0.90, gt=0, le=1)
+    forced_merge_margin: float = Field(default=0.10, ge=0, lt=1)
+    max_body_chars: int = Field(default=32000, ge=1)
+    max_corrections: int = Field(default=2, ge=0, le=5)
+    prune_unused_days: int = Field(default=90, ge=1)
+    prune_min_retrieve: int = Field(default=20, ge=1)
+    prune_min_relevant: int = Field(default=10, ge=1)
+    prune_relevant_used_ratio: float = Field(default=5.0, gt=0)
+
+    @model_validator(mode="after")
+    def _relationships(self) -> SkillEvolutionConfig:
+        if self.forced_merge_margin >= self.forced_merge_score:
+            raise ValueError("forced_merge_margin must be smaller than forced_merge_score")
+        if self.prune_min_relevant > self.prune_min_retrieve:
+            raise ValueError("prune_min_relevant must not exceed prune_min_retrieve")
+        return self
+
+
+class SkillConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    enabled: bool = True
+    retrieval_top_k: int = Field(default=3, ge=1, le=20)
+    retrieval_relative_floor: float = Field(default=0.60, gt=0, le=1)
+    retrieval_query_coverage: float = Field(default=0.20, ge=0, le=1)
+    evolution: SkillEvolutionConfig = SkillEvolutionConfig()
+
+
 class McpBaseConfig(BaseModel):
     """Common, secret-free MCP configuration registered before connection."""
 
@@ -245,6 +289,7 @@ class AppConfig(BaseModel):
     ui: UIConfig = UIConfig()
     tools: ToolConfig = ToolConfig()
     context: ContextConfig = ContextConfig()
+    skill: SkillConfig = SkillConfig()
     mcp: tuple[McpConfig, ...] = ()
 
     @model_validator(mode="after")
