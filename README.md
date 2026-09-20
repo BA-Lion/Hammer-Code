@@ -53,6 +53,21 @@ bearer_token_env = "EXAMPLE_MCP_TOKEN"
 
 `env = { bearer_token_env_var = "EXAMPLE_MCP_TOKEN" }` 不是 HTTP MCP 的有效配置，必须迁移为上面的 `bearer_token_env`。目前不支持任意 headers、OAuth、Basic、mTLS、proxy、cookie 或 token 持久化。
 
+### Hooks
+
+可选的项目本地 Hook 位于 `.hammer-code/hooks.toml`。可从
+`.hammer-code/hooks.example.toml` 复制起步；真实配置已被 Git 忽略。每个 Hook 绑定一个确定的
+生命周期事件，可按声明顺序执行 `command`、一次性 `prompt` 或匿名 `http` Action。严格 TOML
+校验会拒绝未知字段、重复 id、非法条件、认证类 HTTP header 以及 `agent` Action。
+
+Hook command 在展开占位符后，以既有 `shell` 身份经过完整 PermissionService；它不拥有独立或更宽
+的权限。Prompt 只注入下一次模型请求（MCP 后、Skill 前），不会写入 Session 或对话历史。
+HTTP Action 不经工具审批，但只能使用匿名 HTTP(S)、有超时和有界响应，并且不能配置认证、Cookie、
+URL userinfo 或 Secret 引用。`pre_tool_use` Hook 可声明 `reject = true`，仅拒绝当前 Tool Call。
+
+Hook 的 `once`、待注入 Prompt 和后台任务全部属于单个 PrimaryAgent 实例；新建、恢复或切换 Session
+都会获得新的状态。删除或重命名 `hooks.toml` 后重启即可停用 Hook；不支持热重载。
+
 MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不会阻塞其他 Server。配置名称、描述和加载状态会进入下一次模型请求的 MCP 提示片段；MCP 工具默认不进入模型工具列表。模型应先调用始终公开的 `toolSearch`，其找到的最多五个工具会从下一次 Agent Loop 请求开始以完整 schema 公开。未发现的工具即使名称被猜中也不能执行；`/clear` 会清除本次会话的发现状态。
 
 ## 交互

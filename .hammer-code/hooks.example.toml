@@ -1,0 +1,17 @@
+# Copy this file to .hammer-code/hooks.toml to enable project-local Hooks.
+# Do not commit hooks.toml: it can trigger local commands or network requests.
+
+[[hooks]]
+id = "turn-guidance"
+event = "turn_start"
+once = false
+
+[hooks.action]
+type = "prompt"
+prompt = "Follow the project's current instructions while handling $MESSAGE."
+
+# Supported events: session_start, session_end, turn_start, turn_end, pre_send,
+# post_receive, pre_tool_use, post_tool_use, compact, error.
+# Supported actions: command, prompt, http. Agent actions are intentionally unsupported.
+# Command and HTTP fields may use $EVENT, $TOOL_NAME, $FILE_PATH, $MESSAGE, $ERROR,
+# and $TOOL_ARGS.<key>. Unknown or missing placeholders fail that action safely.

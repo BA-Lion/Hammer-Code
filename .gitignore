@@ -10,6 +10,7 @@ dist/
 build/
 *.egg-info/
 .hammer-code/config.toml
+.hammer-code/hooks.toml
 .hammer-code/runtime/
 .hammer-code/tmp/
 /.hammer-code/sessions/

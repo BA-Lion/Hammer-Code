@@ -12,6 +12,7 @@ from hammer_code.app.commands import CommandRegistry, register_builtin_commands
 from hammer_code.app.runtime import PrimaryAgentFactory
 from hammer_code.config import EndpointTrustPolicy, discover_config, load_config, resolve_profile
 from hammer_code.errors import HammerCodeError
+from hammer_code.hooks.config import load_hook_definitions
 from hammer_code.llm.factory import create_model_client
 from hammer_code.mcp.manager import McpManager
 from hammer_code.memory.store import MemoryStore
@@ -63,6 +64,7 @@ async def _run(args: argparse.Namespace) -> int:
     try:
         path = discover_config(args.config)
         config = load_config(path)
+        hook_definitions = load_hook_definitions(path.parent / "hooks.toml")
         workspace_root = path.parent.parent.resolve()
         sessions = SessionManager(workspace_root)
         await asyncio.to_thread(sessions.cleanup)
@@ -118,6 +120,7 @@ async def _run(args: argparse.Namespace) -> int:
             skill_repository=skill_repository,
             project_instructions=ProjectInstructionLoader(workspace_root).load(),
             show_reasoning=config.ui.show_reasoning,
+            hook_definitions=hook_definitions,
         )
         resume_id = getattr(args, "resume", None)
         current = await (factory.resume(resume_id) if resume_id else factory.create_new())

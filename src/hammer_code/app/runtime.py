@@ -14,6 +14,8 @@ from hammer_code.app.context_window import ContextWindow
 from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.config import AppConfig, ResolvedProfile
 from hammer_code.conversation.manager import ConversationManager
+from hammer_code.hooks.config import HookDefinitionConfig, instantiate_hooks
+from hammer_code.hooks.manager import HookManager
 from hammer_code.llm.client import ModelClient
 from hammer_code.mcp.manager import McpManager
 from hammer_code.memory.service import MemoryService
@@ -61,6 +63,7 @@ class PrimaryAgentFactory:
         skill_repository: SkillRepository | None = None,
         project_instructions: str = "",
         show_reasoning: bool = False,
+        hook_definitions: tuple[HookDefinitionConfig, ...] = (),
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.cwd = cwd.resolve()
@@ -77,6 +80,7 @@ class PrimaryAgentFactory:
         self.skill_repository = skill_repository
         self.project_instructions = project_instructions
         self.show_reasoning = show_reasoning
+        self.hook_definitions = hook_definitions
         self._cleanup_old_done = False
 
     async def create_new(self) -> PrimaryAgent:
@@ -84,7 +88,9 @@ class PrimaryAgentFactory:
         try:
             manager = ConversationManager()
             manager.create(self.resolved)
-            return self._build(manager, SessionCoordinator(session, manager), stale_restore=False)
+            agent = self._build(manager, SessionCoordinator(session, manager), stale_restore=False)
+            await agent.start()
+            return agent
         except Exception:
             # A newly-created empty session is the only construction failure that may be removed.
             try:
@@ -100,7 +106,9 @@ class PrimaryAgentFactory:
         manager = ConversationManager()
         manager.restore(self.resolved, restored.messages, session.meta.total_tokens)
         coordinator = SessionCoordinator.restored(session, manager, restored)
-        return self._build(manager, coordinator, stale_restore=stale)
+        agent = self._build(manager, coordinator, stale_restore=stale)
+        await agent.start()
+        return agent
 
     def _build(
         self,
@@ -138,6 +146,9 @@ class PrimaryAgentFactory:
             sanitized_environment(),
             skill_service,
         )
+        hooks = HookManager(
+            instantiate_hooks(self.hook_definitions), self.permissions, execution_context, self.ui
+        )
         executor = ToolExecutor(
             self.registry,
             self.permissions,
@@ -146,6 +157,7 @@ class PrimaryAgentFactory:
             self.config.context,
             TokenEstimator(),
             context_manager.observe_tool_result,
+            hooks,
         )
         if skill_service is not None:
             skill_service.bind_fork_runtime(
@@ -202,6 +214,7 @@ class PrimaryAgentFactory:
             runtime,
             skill_service,
             evolution,
+            hooks,
         )
 
     def _prompt(self, mode: object) -> str:

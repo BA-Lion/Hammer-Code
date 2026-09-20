@@ -11,6 +11,8 @@ from pydantic import BaseModel, ValidationError
 from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.config import ContextConfig
 from hammer_code.domain.messages import TextBlock, ToolCallBlock, ToolResultBlock
+from hammer_code.hooks.manager import HookManager
+from hammer_code.hooks.models import HookContext, LifecycleEvent
 from hammer_code.permissions.models import PermissionRequest
 from hammer_code.permissions.paths import PathPolicy
 from hammer_code.permissions.service import PermissionService
@@ -40,6 +42,7 @@ class ToolExecutor:
     context_config: ContextConfig = ContextConfig()
     estimator: TokenEstimator = TokenEstimator()
     observer: ToolResultObserver | None = None
+    hooks: HookManager | None = None
 
     async def execute_batch(self, calls: tuple[ToolCallBlock, ...]) -> tuple[ToolResultBlock, ...]:
         prepared: list[tuple[ToolCallBlock, BaseModel, PermissionRequest] | ToolResultBlock] = []
@@ -56,6 +59,21 @@ class ToolExecutor:
             try:
                 arguments = tool.input_model.model_validate(dict(call.arguments))
                 paths = self._paths_for(tool.name, arguments)
+                hook_context = HookContext(
+                    tool_name=tool.name,
+                    tool_args=arguments.model_dump(mode="json"),
+                    file_path=str(paths[0]) if len(paths) == 1 else "",
+                )
+                if (
+                    self.hooks is not None
+                    and (
+                        await self.hooks.dispatch(LifecycleEvent.PRE_TOOL_USE, hook_context)
+                    ).rejected
+                ):
+                    prepared.append(
+                        self._error(call.call_id, "tool call rejected by configured hook")
+                    )
+                    continue
                 request = PermissionRequest.for_tool(
                     tool.name,
                     tool.category.value,
@@ -136,13 +154,40 @@ class ToolExecutor:
             raw = await tool.execute(self.context, arguments)
             if self.observer is not None:
                 self.observer(call, arguments, raw)
-            return ToolResultBlock(
+            result = ToolResultBlock(
                 call.call_id, (TextBlock(raw.content or "(empty output)"),), raw.is_error
             )
+            if self.hooks is not None:
+                await self.hooks.dispatch(
+                    LifecycleEvent.POST_TOOL_USE,
+                    HookContext(
+                        tool_name=call.name,
+                        tool_args=arguments.model_dump(mode="json"),
+                        file_path=str(self._paths_for(call.name, arguments)[0])
+                        if len(self._paths_for(call.name, arguments)) == 1
+                        else "",
+                        message="" if raw.is_error else raw.content,
+                        error=raw.content if raw.is_error else "",
+                    ),
+                )
+            return result
         except asyncio.CancelledError:
             raise
         except Exception:
-            return self._error(call.call_id, "tool execution failed")
+            result = self._error(call.call_id, "tool execution failed")
+            if self.hooks is not None:
+                await self.hooks.dispatch(
+                    LifecycleEvent.POST_TOOL_USE,
+                    HookContext(
+                        tool_name=call.name,
+                        tool_args=arguments.model_dump(mode="json"),
+                        file_path=str(self._paths_for(call.name, arguments)[0])
+                        if len(self._paths_for(call.name, arguments)) == 1
+                        else "",
+                        error="tool execution failed",
+                    ),
+                )
+            return result
 
     @staticmethod
     def _error(call_id: str, message: str) -> ToolResultBlock:

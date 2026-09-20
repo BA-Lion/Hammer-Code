@@ -23,6 +23,8 @@ from hammer_code.domain.events import (
 from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage, UsageStatus, UsageSummary
 from hammer_code.errors import ContextCompactionError, HammerCodeError, StreamInterruptedError
+from hammer_code.hooks.manager import HookManager
+from hammer_code.hooks.models import HookContext, LifecycleEvent
 from hammer_code.llm.client import ModelClient
 from hammer_code.mcp.manager import McpManager
 from hammer_code.memory.service import MemoryService
@@ -83,6 +85,7 @@ class PrimaryAgent:
         runtime: RuntimeStore | None = None,
         skill_service: SkillInvocationService | None = None,
         skill_evolution: SkillEvolutionService | None = None,
+        hooks: HookManager | None = None,
     ) -> None:
         (
             self.manager,
@@ -105,6 +108,7 @@ class PrimaryAgent:
             self.runtime,
             self.skill_service,
             self.skill_evolution,
+            self.hooks,
         ) = (
             manager,
             client,
@@ -126,11 +130,13 @@ class PrimaryAgent:
             runtime,
             skill_service,
             skill_evolution,
+            hooks,
         )
         self._accepting_turns = True
         self._closed = False
         self._finalization_lock = asyncio.Lock()
         self._previous_skill_observation: SkillObservation | None = None
+        self._started = False
 
     @property
     def session_id(self) -> str:
@@ -183,8 +189,13 @@ class PrimaryAgent:
             before = self.manager.snapshot_committed()
             if self.memory_service is not None:
                 await self.memory_service.flush_before_compaction()
-            preparation = await self.context_manager.compact_now(mcp_prompt=prompt, tools=tools)
+            batch = self.hooks.snapshot_prompt() if self.hooks else None
+            preparation = await self.context_manager.compact_now(
+                mcp_prompt=prompt, hook_prompt=batch.text if batch else "", tools=tools
+            )
             await self._persist_preparation(before, preparation)
+            if preparation.compact_event is not None and self.hooks is not None:
+                await self.hooks.dispatch(LifecycleEvent.COMPACT)
             if preparation.compact_event is None:
                 self.ui.info("Nothing to compact.")
             else:
@@ -216,6 +227,13 @@ class PrimaryAgent:
         self._accepting_turns = False
         await self._finish(cancel_memory=True)
 
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        if self.hooks is not None:
+            await self.hooks.dispatch(LifecycleEvent.SESSION_START)
+
     async def run_skill(self, name: str, arguments: str) -> None:
         """Run a local inline Skill as an ordinary durable turn."""
         if self.skill_service is None:
@@ -239,7 +257,10 @@ class PrimaryAgent:
         unknown_count = 0
         skill_prompt = ""
         skill_started = False
+        turn_error = ""
         try:
+            if self.hooks is not None:
+                await self.hooks.dispatch(LifecycleEvent.TURN_START, HookContext(message=text))
             if self.skill_service is not None:
                 try:
                     skill_snapshot = await self.skill_service.repository.snapshot_for_turn()
@@ -294,23 +315,6 @@ class PrimaryAgent:
                         skill_prompt = prepared.prompt
                 except SkillRepositoryError:
                     self.ui.error("Skill catalog is unavailable for this turn.")
-            if self.context_manager is not None:
-                pending = Message(Role.USER, (TextBlock(text),))
-                prompt, tools = self._sample_context()
-                before = self.manager.snapshot_committed()
-                preparation = await self.context_manager.prepare_before_request(
-                    current_suffix=(pending,),
-                    mcp_prompt=prompt,
-                    skill_prompt=skill_prompt,
-                    tools=tools,
-                    before_compaction=(
-                        self.memory_service.flush_before_compaction
-                        if self.memory_service is not None
-                        else None
-                    ),
-                )
-                self._show_preparation(preparation)
-                await self._persist_preparation(before, preparation)
             turn = self.manager.begin_turn(text)
             while request_count < 50:
                 request_count += 1
@@ -319,11 +323,18 @@ class PrimaryAgent:
                 announced_calls: set[str] = set()
                 reasoning_status_started = False
                 prompt, tools = self._sample_context()
-                if self.context_manager is not None and request_count > 1:
+                hooks = self.hooks
+                if hooks is not None:
+                    await hooks.dispatch(LifecycleEvent.PRE_SEND, HookContext(message=text))
+                    hook_batch = hooks.snapshot_prompt()
+                else:
+                    hook_batch = None
+                if self.context_manager is not None:
                     before = self.manager.snapshot_committed()
                     preparation = await self.context_manager.prepare_before_request(
                         current_suffix=self.manager.snapshot_staged(turn),
                         mcp_prompt=prompt,
+                        hook_prompt=hook_batch.text if hook_batch else "",
                         skill_prompt=skill_prompt,
                         tools=tools,
                         before_compaction=(
@@ -334,6 +345,9 @@ class PrimaryAgent:
                     )
                     self._show_preparation(preparation)
                     await self._persist_preparation(before, preparation)
+                    if preparation.compact_event is not None and hooks is not None:
+                        await hooks.dispatch(LifecycleEvent.COMPACT)
+                        hook_batch = hooks.snapshot_prompt()
                 memory_prompt = (
                     await self.memory_service.read_index_prompt()
                     if self.memory_service is not None
@@ -342,6 +356,7 @@ class PrimaryAgent:
                 snapshot = self.context_window.snapshot(
                     mcp_prompt=prompt,
                     project_instructions=self.project_instructions,
+                    hook_prompt=hook_batch.text if hook_batch else "",
                     skill_prompt=skill_prompt,
                     memory_prompt=memory_prompt,
                     stale_prompt=build_stale_restore_prompt() if self.stale_restore else "",
@@ -359,6 +374,8 @@ class PrimaryAgent:
                     snapshot.tools,
                     self.max_output_tokens,
                 )
+                if hook_batch is not None and hooks is not None:
+                    hooks.commit_prompt(hook_batch)
                 self.manager.record_usage(
                     turn,
                     request_id,
@@ -391,6 +408,15 @@ class PrimaryAgent:
                 if completed is None:
                     raise StreamInterruptedError("Client ended without a completion")
                 response = completed.response
+                if self.hooks is not None:
+                    visible = "".join(
+                        block.text
+                        for block in response.message.content
+                        if isinstance(block, TextBlock)
+                    )
+                    await self.hooks.dispatch(
+                        LifecycleEvent.POST_RECEIVE, HookContext(message=visible)
+                    )
                 calls = tuple(
                     block for block in response.message.content if isinstance(block, ToolCallBlock)
                 )
@@ -419,23 +445,30 @@ class PrimaryAgent:
             committed = self.manager.interrupt(turn)
             await self._persist_turn_outcome(committed, completed=False)
         except ToolBatchCancelled as exc:
+            turn_error = "tool execution cancelled"
             if turn is not None:
                 self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
                 committed = self.manager.interrupt(turn)
                 await self._persist_turn_outcome(committed, completed=False)
             raise asyncio.CancelledError from exc
         except asyncio.CancelledError:
+            turn_error = "turn cancelled"
             if turn is not None:
                 committed = self.manager.interrupt(turn)
                 await self._persist_turn_outcome(committed, completed=False)
             raise
         except Exception as exc:
+            turn_error = (
+                str(exc) if isinstance(exc, HammerCodeError) else "unexpected model failure"
+            )
             if turn is not None:
                 committed = self.manager.interrupt(turn)
                 await self._persist_turn_outcome(committed, completed=False)
             self.ui.error(
                 str(exc) if isinstance(exc, HammerCodeError) else "Unexpected model failure"
             )
+            if self.hooks is not None:
+                await self.hooks.dispatch(LifecycleEvent.ERROR, HookContext(error=turn_error))
         finally:
             if skill_started and self.skill_service is not None:
                 observation = self.skill_service.end_turn(
@@ -445,11 +478,21 @@ class PrimaryAgent:
                     self._previous_skill_observation = observation
             if self.manager.conversation and turn is not None:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_turn(turn.id))
+            if self.hooks is not None:
+                await self.hooks.dispatch(
+                    LifecycleEvent.TURN_END, HookContext(message=text, error=turn_error)
+                )
 
     async def _finish(self, *, cancel_memory: bool) -> None:
         async with self._finalization_lock:
             if self._closed:
                 return
+            if self.hooks is not None:
+                await self.hooks.dispatch(LifecycleEvent.SESSION_END)
+                if cancel_memory:
+                    await self.hooks.cancel()
+                else:
+                    await self.hooks.drain()
             if self.memory_service is not None:
                 if cancel_memory:
                     await self.memory_service.cancel()
