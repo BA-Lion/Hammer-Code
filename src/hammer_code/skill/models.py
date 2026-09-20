@@ -115,7 +115,7 @@ class EvolutionQueueItem:
     messages: tuple[Message, ...]
     current_input: str
     previous_observation: SkillObservation | None
-    forced_ref: SkillRef | None = None
+    update_target_ref: SkillRef | None = None
     feedback: str | None = None
 
 

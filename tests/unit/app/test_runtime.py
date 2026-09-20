@@ -51,6 +51,9 @@ class _UI:
     def memory_warning(self, message: str) -> None:
         del message
 
+    def skill_warning(self, message: str) -> None:
+        del message
+
 
 def _factory(tmp_path: Path) -> PrimaryAgentFactory:
     config = AppConfig.model_validate(

@@ -46,6 +46,9 @@ def test_cli_builds_a_no_tool_prompt_for_chat_loop(
         def banner(self, *_: object) -> None:
             pass
 
+        def skill_warning(self, message: str) -> None:
+            del message
+
     class FakeClient:
         async def aclose(self) -> None:
             pass

@@ -96,6 +96,9 @@ class FakeUI:
     def memory_warning(self, message: str) -> None:
         self.errors.append(message)
 
+    def skill_warning(self, message: str) -> None:
+        self.errors.append(message)
+
 
 class FakeClient(ModelClient):
     def __init__(

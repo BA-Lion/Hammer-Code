@@ -32,6 +32,9 @@ class _UI:
     def memory_warning(self, message: str) -> None:
         self.warnings.append(message)
 
+    def skill_warning(self, message: str) -> None:
+        self.warnings.append(message)
+
     def info(self, message: str) -> None:
         self.infos.append(message)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -14,8 +15,8 @@ from pydantic import ValidationError
 from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.config import SkillConfig
 from hammer_code.conversation.manager import ConversationManager
-from hammer_code.domain.events import ModelRequest, ResponseCompleted, UsageUpdated
-from hammer_code.domain.messages import Message, RefusalBlock, TextBlock
+from hammer_code.domain.events import ModelRequest, ResponseCompleted, StopReason, UsageUpdated
+from hammer_code.domain.messages import Message, ReasoningBlock, RefusalBlock, TextBlock
 from hammer_code.llm.client import ModelClient
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
@@ -46,6 +47,14 @@ class SkillEvolutionError(ValueError):
     pass
 
 
+class SkillEvolutionStageError(SkillEvolutionError):
+    """Keep an internal cause while exposing only a safe processing stage."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"Skill evolution failed during {stage}")
+        self.stage = stage
+
+
 def _can_write(config: SkillConfig, permissions: PermissionService) -> bool:
     return (
         config.enabled
@@ -70,6 +79,8 @@ class SkillEvolutionService:
         config: SkillConfig,
         max_output_tokens: int,
         available_tool_names: tuple[str, ...] = (),
+        *,
+        warning: Callable[[str], None],
     ) -> None:
         self.client = client
         self.repository = repository
@@ -78,6 +89,7 @@ class SkillEvolutionService:
         self.config = config
         self.max_output_tokens = max_output_tokens
         self.available_tool_names = frozenset(available_tool_names)
+        self._warning = warning
         self._queue: deque[EvolutionQueueItem] = deque()
         self._task: asyncio.Task[None] | None = None
         self._accepting = True
@@ -100,7 +112,15 @@ class SkillEvolutionService:
             )
         snapshot = await self.repository.snapshot_for_turn()
         definition = SkillCatalog.resolve(snapshot, name, user=False, model=False)
-        self._queue.append(EvolutionQueueItem((), "", None, definition.ref, feedback.strip()))
+        self._queue.append(
+            EvolutionQueueItem(
+                (),
+                "",
+                None,
+                update_target_ref=definition.ref,
+                feedback=feedback.strip(),
+            )
+        )
         self._start_worker()
 
     def _start_worker(self) -> None:
@@ -133,9 +153,20 @@ class SkillEvolutionService:
                 await self._process(item)
             except asyncio.CancelledError:
                 raise
+            except SkillEvolutionStageError as exc:
+                self._warn_failure(exc.stage)
             except Exception:
-                # Main conversation progress never depends on a maintenance result.
-                continue
+                self._warn_failure("processing")
+
+    def _warn_failure(self, stage: str) -> None:
+        """Report once per failed item without leaking model or exception content."""
+        try:
+            self._warning(
+                f"Skill evolution failed during {stage}; this maintenance item was skipped."
+            )
+        except Exception:
+            # A presentation failure must not terminate the queue or affect the main conversation.
+            pass
 
     def _visible(self, messages: tuple[Message, ...]) -> tuple[Message, ...]:
         visible: list[Message] = []
@@ -196,18 +227,24 @@ class SkillEvolutionService:
                 if completed is not None:
                     raise SkillEvolutionError("maintenance client emitted duplicate completion")
                 completed = event
-        if completed is None or completed.response.stop_reason.value != "end_turn":
+        if completed is None or completed.response.stop_reason not in {
+            StopReason.END_TURN,
+            StopReason.OTHER,
+        }:
             raise SkillEvolutionError(
-                "maintenance request did not produce one completed text response"
+                "Skill Evolution request did not produce one completed text response"
             )
-        if any(not isinstance(block, TextBlock) for block in completed.response.message.content):
-            raise SkillEvolutionError("maintenance response included non-text content")
+        if any(
+            not isinstance(block, (TextBlock, ReasoningBlock))
+            for block in completed.response.message.content
+        ):
+            raise SkillEvolutionError("Skill Evolution response included unsupported content")
         text_blocks = tuple(
             block for block in completed.response.message.content if isinstance(block, TextBlock)
         )
         text = "".join(block.text for block in text_blocks)
         if not text.strip():
-            raise SkillEvolutionError("maintenance response was empty")
+            raise SkillEvolutionError("Skill Evolution response was empty")
         return text
 
     async def _validated(
@@ -262,7 +299,10 @@ class SkillEvolutionService:
         )
 
     def _candidate_definitions(
-        self, snapshot: CatalogSnapshot, candidate: ExtractedCandidate, forced_ref: SkillRef | None
+        self,
+        snapshot: CatalogSnapshot,
+        candidate: ExtractedCandidate,
+        update_target_ref: SkillRef | None,
     ) -> tuple[SkillDefinition, ...]:
         query = self._candidate_query(candidate)
         matches = (
@@ -276,27 +316,35 @@ class SkillEvolutionService:
             else ()
         )
         refs = [item.ref for item in matches]
-        if forced_ref is not None and forced_ref not in refs:
-            refs.insert(0, forced_ref)
+        if update_target_ref is not None and update_target_ref not in refs:
+            refs.insert(0, update_target_ref)
         selected: list[SkillDefinition] = []
-        forced = (
-            snapshot.by_identity.get((forced_ref.scope, forced_ref.name)) if forced_ref else None
+        update_target = (
+            snapshot.by_identity.get((update_target_ref.scope, update_target_ref.name))
+            if update_target_ref
+            else None
         )
         for ref in refs:
             definition = snapshot.by_identity.get((ref.scope, ref.name))
             if definition is None or definition.version != ref.version:
                 continue
-            prompt = build_maintenance_prompt(candidate, tuple(selected + [definition]), forced)
+            prompt = build_maintenance_prompt(
+                candidate, tuple(selected + [definition]), update_target
+            )
             if (
                 self._estimator.estimate_text(prompt)
                 > self.config.evolution.max_maintenance_input_tokens
             ):
-                if ref == forced_ref:
-                    raise SkillEvolutionError("forced target exceeds maintenance input budget")
+                if ref == update_target_ref:
+                    raise SkillEvolutionError(
+                        "selected update target exceeds maintenance input budget"
+                    )
                 continue
             selected.append(definition)
-        if forced_ref is not None and not any(item.ref == forced_ref for item in selected):
-            raise SkillEvolutionError("forced target is unavailable")
+        if update_target_ref is not None and not any(
+            item.ref == update_target_ref for item in selected
+        ):
+            raise SkillEvolutionError("selected update target is unavailable")
         return tuple(selected)
 
     @staticmethod
@@ -324,7 +372,7 @@ class SkillEvolutionService:
             candidate.allowed_tools,
         )
 
-    def _automatic_forced_ref(
+    def _automatic_update_target_ref(
         self, snapshot: CatalogSnapshot, candidate: ExtractedCandidate
     ) -> SkillRef | None:
         if snapshot.index is None:
@@ -350,11 +398,9 @@ class SkillEvolutionService:
         self,
         operation: MaintenanceOperation,
         candidates: tuple[SkillDefinition, ...],
-        forced_ref: SkillRef | None,
+        update_target_ref: SkillRef | None,
     ) -> None:
         if operation.action == "discard":
-            if forced_ref is not None:
-                raise SkillEvolutionError("explicit feedback must merge its forced target")
             return
         assert operation.skill is not None
         if len(operation.skill.body) > self.config.evolution.max_body_chars:
@@ -364,8 +410,10 @@ class SkillEvolutionService:
         ).difference(self.available_tool_names):
             raise SkillEvolutionError("Maintenance output contains unknown allowed tools")
         if operation.action == "add":
-            if forced_ref is not None:
-                raise SkillEvolutionError("explicit feedback cannot add a Skill")
+            if update_target_ref is not None:
+                raise SkillEvolutionError(
+                    "Maintenance cannot add when an update target is selected"
+                )
             return
         assert operation.target is not None
         target = next(
@@ -378,48 +426,68 @@ class SkillEvolutionService:
         )
         if target is None or operation.skill.name != target.name:
             raise SkillEvolutionError("Maintenance merge target is not an offered candidate")
-        if forced_ref is not None and target.ref != forced_ref:
-            raise SkillEvolutionError("Maintenance merge does not match forced target")
+        if update_target_ref is not None and target.ref != update_target_ref:
+            raise SkillEvolutionError("Maintenance merge does not match selected update target")
 
     async def _process(self, item: EvolutionQueueItem) -> None:
-        if not _can_write(self.config, self.permissions):
-            return
-        snapshot = await self.repository.snapshot_for_turn()
-        previous = item.previous_observation
-        extractor = await self._validated(
-            "Extractor",
-            ExtractorResponse,
-            build_extractor_prompt(
-                self._truncate_current_input(item.current_input),
-                previous.retrieved if previous and previous.completed else (),
-                item.feedback,
-            ),
-            self._visible(item.messages),
-        )
-        assert isinstance(extractor, ExtractorResponse)
-        evaluations = self._validate_extractor(extractor, previous)
-        if evaluations:
-            await self.repository.record_evaluations(evaluations)
-        if extractor.candidate is None:
-            await self.repository.record_discard(extractor.discard_reason or "Extractor discarded")
-            return
-        forced_ref = item.forced_ref or self._automatic_forced_ref(snapshot, extractor.candidate)
-        candidates = self._candidate_definitions(snapshot, extractor.candidate, forced_ref)
-        forced = (
-            snapshot.by_identity.get((forced_ref.scope, forced_ref.name)) if forced_ref else None
-        )
-        operation = await self._validated(
-            "Maintenance",
-            MaintenanceOperation,
-            build_maintenance_prompt(extractor.candidate, candidates, forced),
-            (),
-        )
-        assert isinstance(operation, MaintenanceOperation)
-        self._validate_operation(operation, candidates, forced_ref)
-        if operation.action == "discard":
-            await self.repository.record_discard(operation.reason)
-            return
-        await self._commit(snapshot, operation)
+        stage = "permission check"
+        try:
+            if not _can_write(self.config, self.permissions):
+                return
+            stage = "catalog snapshot"
+            snapshot = await self.repository.snapshot_for_turn()
+            previous = item.previous_observation
+            stage = "Extractor"
+            extractor = await self._validated(
+                "Extractor",
+                ExtractorResponse,
+                build_extractor_prompt(
+                    self._truncate_current_input(item.current_input),
+                    previous.retrieved if previous and previous.completed else (),
+                    item.feedback,
+                ),
+                self._visible(item.messages),
+            )
+            assert isinstance(extractor, ExtractorResponse)
+            evaluations = self._validate_extractor(extractor, previous)
+            if evaluations:
+                stage = "evaluation persistence"
+                await self.repository.record_evaluations(evaluations)
+            if extractor.candidate is None:
+                stage = "commit"
+                await self.repository.record_discard(
+                    extractor.discard_reason or "Extractor discarded"
+                )
+                return
+            stage = "Maintenance"
+            update_target_ref = item.update_target_ref or self._automatic_update_target_ref(
+                snapshot, extractor.candidate
+            )
+            candidates = self._candidate_definitions(
+                snapshot, extractor.candidate, update_target_ref
+            )
+            update_target = (
+                snapshot.by_identity.get((update_target_ref.scope, update_target_ref.name))
+                if update_target_ref
+                else None
+            )
+            operation = await self._validated(
+                "Maintenance",
+                MaintenanceOperation,
+                build_maintenance_prompt(extractor.candidate, candidates, update_target),
+                (),
+            )
+            assert isinstance(operation, MaintenanceOperation)
+            self._validate_operation(operation, candidates, update_target_ref)
+            stage = "commit"
+            if operation.action == "discard":
+                await self.repository.record_discard(operation.reason)
+                return
+            await self._commit(snapshot, operation)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise SkillEvolutionStageError(stage) from exc
 
     @staticmethod
     def _definition(

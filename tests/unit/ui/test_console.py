@@ -125,3 +125,12 @@ def test_console_displays_context_estimates_as_a_compaction_block() -> None:
     ui = ConsoleUI(Console(file=output, force_terminal=False))
     ui.compact(CompactEvent(100, 20, 80))
     assert "Compacted context: ~100 → ~20 tokens; saved ~80" in output.getvalue()
+
+
+def test_console_displays_skill_warning_as_a_separate_block() -> None:
+    output = StringIO()
+    ui = ConsoleUI(Console(file=output, force_terminal=False))
+
+    ui.skill_warning("Evolution failed safely.")
+
+    assert output.getvalue() == "Skill warning: Evolution failed safely.\n"

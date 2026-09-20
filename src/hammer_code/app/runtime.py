@@ -176,6 +176,7 @@ class PrimaryAgentFactory:
                 self.config.skill,
                 self.resolved.profile.max_output_tokens,
                 self.registry.exposed_names(),
+                warning=self.ui.skill_warning,
             )
             if self.skill_repository is not None
             else None
