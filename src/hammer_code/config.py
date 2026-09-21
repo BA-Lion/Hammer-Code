@@ -31,6 +31,8 @@ BUILTIN_TOOL_NAMES = {
     "glob",
     "shell",
     "use_skill",
+    "run_subagent",
+    "subagent_task",
 }
 McpTransport = Literal["stdio", "streamable_http"]
 _MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -185,6 +187,14 @@ class SkillConfig(BaseModel):
     evolution: SkillEvolutionConfig = SkillEvolutionConfig()
 
 
+class SubagentConfig(BaseModel):
+    """Bounded controls for in-process Subagent execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    default_max_iterations: int = Field(default=20, ge=1, le=50)
+    max_background_tasks: int = Field(default=4, ge=1, le=16)
+
+
 class McpBaseConfig(BaseModel):
     """Common, secret-free MCP configuration registered before connection."""
 
@@ -290,6 +300,7 @@ class AppConfig(BaseModel):
     tools: ToolConfig = ToolConfig()
     context: ContextConfig = ContextConfig()
     skill: SkillConfig = SkillConfig()
+    subagent: SubagentConfig = SubagentConfig()
     mcp: tuple[McpConfig, ...] = ()
 
     @model_validator(mode="after")

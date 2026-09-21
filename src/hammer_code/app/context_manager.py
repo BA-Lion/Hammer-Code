@@ -120,6 +120,7 @@ class ContextManager:
         *,
         current_suffix: tuple[Message, ...],
         mcp_prompt: str,
+        subagent_prompt: str = "",
         hook_prompt: str = "",
         skill_prompt: str = "",
         tools: tuple[ToolDefinition, ...],
@@ -130,6 +131,7 @@ class ContextManager:
             self.manager.snapshot_committed(),
             current_suffix,
             mcp_prompt,
+            subagent_prompt,
             hook_prompt,
             skill_prompt,
             tools,
@@ -139,13 +141,21 @@ class ContextManager:
         if before_compaction is not None:
             await before_compaction()
         return await self._compact(
-            current_suffix, mcp_prompt, hook_prompt, skill_prompt, tools, before, manual=False
+            current_suffix,
+            mcp_prompt,
+            subagent_prompt,
+            hook_prompt,
+            skill_prompt,
+            tools,
+            before,
+            manual=False,
         )
 
     async def compact_now(
         self,
         *,
         mcp_prompt: str,
+        subagent_prompt: str = "",
         hook_prompt: str = "",
         skill_prompt: str = "",
         tools: tuple[ToolDefinition, ...],
@@ -154,9 +164,11 @@ class ContextManager:
         committed = self.manager.snapshot_committed()
         if len(self._split_turns(committed)) < 3:
             return ContextPreparation()
-        before = self._estimate(committed, (), mcp_prompt, hook_prompt, skill_prompt, tools)
+        before = self._estimate(
+            committed, (), mcp_prompt, subagent_prompt, hook_prompt, skill_prompt, tools
+        )
         return await self._compact(
-            (), mcp_prompt, hook_prompt, skill_prompt, tools, before, manual=True
+            (), mcp_prompt, subagent_prompt, hook_prompt, skill_prompt, tools, before, manual=True
         )
 
     def clear(self) -> bool:
@@ -169,6 +181,7 @@ class ContextManager:
         committed: tuple[Message, ...],
         suffix: tuple[Message, ...],
         mcp_prompt: str,
+        subagent_prompt: str,
         hook_prompt: str,
         skill_prompt: str,
         tools: tuple[ToolDefinition, ...],
@@ -178,6 +191,7 @@ class ContextManager:
             for piece in (
                 self.base_system_prompt,
                 mcp_prompt,
+                subagent_prompt,
                 hook_prompt,
                 skill_prompt,
                 self.recovery_prompt,
@@ -233,6 +247,7 @@ class ContextManager:
         self,
         suffix: tuple[Message, ...],
         mcp_prompt: str,
+        subagent_prompt: str,
         hook_prompt: str,
         skill_prompt: str,
         tools: tuple[ToolDefinition, ...],
@@ -264,7 +279,13 @@ class ContextManager:
                 was_compacted = self.has_compacted
                 self.has_compacted = True
                 after = self._estimate(
-                    replacement, suffix, mcp_prompt, hook_prompt, skill_prompt, tools
+                    replacement,
+                    suffix,
+                    mcp_prompt,
+                    subagent_prompt,
+                    hook_prompt,
+                    skill_prompt,
+                    tools,
                 )
                 if (manual and after >= before) or (
                     not manual and after >= self.config.compact_trigger_tokens

@@ -214,3 +214,30 @@ def test_skill_evolution_config_is_opt_in_and_validates_prune_and_merge_relation
         SkillEvolutionConfig(forced_merge_score=0.5, forced_merge_margin=0.5)
     with pytest.raises(ValueError):
         SkillEvolutionConfig(prune_min_retrieve=5, prune_min_relevant=6)
+
+
+def test_subagent_config_is_bounded_and_defaulted() -> None:
+    from hammer_code.config import AppConfig, SubagentConfig
+
+    assert SubagentConfig().default_max_iterations == 20
+    assert SubagentConfig().max_background_tasks == 4
+    with pytest.raises(ValueError):
+        SubagentConfig(default_max_iterations=51)
+    config = AppConfig.model_validate(
+        {
+            "default_profile": "main",
+            "profiles": {
+                "main": {
+                    "protocol": "openai_responses",
+                    "model": "model",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key_env": "TEST_KEY",
+                    "max_output_tokens": 10,
+                    "timeout_seconds": 5,
+                    "max_retries": 0,
+                }
+            },
+            "subagent": {"default_max_iterations": 5, "max_background_tasks": 2},
+        }
+    )
+    assert config.subagent.default_max_iterations == 5

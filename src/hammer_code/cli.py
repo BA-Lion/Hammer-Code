@@ -24,13 +24,16 @@ from hammer_code.project_instructions import ProjectInstructionLoader
 from hammer_code.session.manager import SessionManager
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.skill.tool import UseSkillTool
+from hammer_code.subagent.repository import SubagentRepository
 from hammer_code.tools.builtin import (
     CreateFileTool,
     EditFileTool,
     GlobTool,
     GrepTool,
     ReadFileTool,
+    RunSubagentTool,
     ShellTool,
+    SubagentTaskTool,
     ToolSearchTool,
 )
 from hammer_code.tools.registry import ToolRegistry
@@ -91,6 +94,8 @@ async def _run(args: argparse.Namespace) -> int:
             GlobTool(),
             ShellTool(),
             UseSkillTool(),
+            RunSubagentTool(),
+            SubagentTaskTool(),
         ):
             registry.register(tool)
         rules = RuleStore(workspace_root)
@@ -99,6 +104,10 @@ async def _run(args: argparse.Namespace) -> int:
         mcp_manager = McpManager(config.mcp, registry, workspace_root, ui=ui)
         registry.register(ToolSearchTool(registry, mcp_manager))
         skill_repository = SkillRepository(workspace_root)
+        subagent_repository = SubagentRepository(
+            workspace_root, config.subagent, getattr(ui, "skill_warning", lambda _: None)
+        )
+        await subagent_repository.initialize()
         try:
             await skill_repository.initialize()
         except Exception:
@@ -118,6 +127,7 @@ async def _run(args: argparse.Namespace) -> int:
             memory_store=MemoryStore(workspace_root),
             maintenance_lock=asyncio.Lock(),
             skill_repository=skill_repository,
+            subagent_repository=subagent_repository,
             project_instructions=ProjectInstructionLoader(workspace_root).load(),
             show_reasoning=config.ui.show_reasoning,
             hook_definitions=hook_definitions,

@@ -37,6 +37,13 @@ from hammer_code.skill.models import SkillObservation
 from hammer_code.skill.prompts import build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepositoryError
 from hammer_code.skill.service import SkillInvocationService
+from hammer_code.subagent.models import ParentRequestSnapshot
+from hammer_code.subagent.prompts import build_subagent_catalog_prompt
+from hammer_code.subagent.service import (
+    BackgroundTaskManager,
+    SubagentService,
+    format_background_results,
+)
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.tools.runtime import RuntimeStore
@@ -86,6 +93,8 @@ class PrimaryAgent:
         skill_service: SkillInvocationService | None = None,
         skill_evolution: SkillEvolutionService | None = None,
         hooks: HookManager | None = None,
+        subagent_tasks: BackgroundTaskManager | None = None,
+        subagent_service: SubagentService | None = None,
     ) -> None:
         (
             self.manager,
@@ -109,6 +118,8 @@ class PrimaryAgent:
             self.skill_service,
             self.skill_evolution,
             self.hooks,
+            self.subagent_tasks,
+            self.subagent_service,
         ) = (
             manager,
             client,
@@ -131,10 +142,13 @@ class PrimaryAgent:
             skill_service,
             skill_evolution,
             hooks,
+            subagent_tasks,
+            subagent_service,
         )
         self._accepting_turns = True
         self._closed = False
         self._finalization_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._previous_skill_observation: SkillObservation | None = None
         self._started = False
 
@@ -163,22 +177,25 @@ class PrimaryAgent:
         )
 
     async def clear(self) -> None:
-        if self.skill_evolution is not None:
-            await self.skill_evolution.wait_idle()
-        if self.memory_service is not None:
-            await self.memory_service.wait_idle()
-        self.manager.clear()
-        if self.session_coordinator is not None:
-            await self.session_coordinator.clear_history()
-        cleanup_ok = self.context_manager.clear() if self.context_manager else True
-        if self.registry:
-            self.registry.clear_discovered()
-        if cleanup_ok:
-            self.ui.info("Conversation cleared.")
-        else:
-            self.ui.error(
-                "Conversation cleared, but some temporary tool results could not be removed."
-            )
+        async with self._lifecycle_lock:
+            if self.subagent_tasks is not None:
+                await self.subagent_tasks.cancel_all(close=False, discard_results=True)
+            if self.skill_evolution is not None:
+                await self.skill_evolution.wait_idle()
+            if self.memory_service is not None:
+                await self.memory_service.wait_idle()
+            self.manager.clear()
+            if self.session_coordinator is not None:
+                await self.session_coordinator.clear_history()
+            cleanup_ok = self.context_manager.clear() if self.context_manager else True
+            if self.registry:
+                self.registry.clear_discovered()
+            if cleanup_ok:
+                self.ui.info("Conversation cleared.")
+            else:
+                self.ui.error(
+                    "Conversation cleared, but some temporary tool results could not be removed."
+                )
 
     async def compact(self) -> None:
         if self.context_manager is None:
@@ -249,6 +266,10 @@ class PrimaryAgent:
         self.ui.info("Skill feedback queued for controlled maintenance.")
 
     async def run_turn(self, text: str, skill: tuple[str, str] | None = None) -> None:
+        async with self._lifecycle_lock:
+            await self._run_turn(text, skill)
+
+    async def _run_turn(self, text: str, skill: tuple[str, str] | None = None) -> None:
         if not self._accepting_turns:
             raise HammerCodeError("Agent is draining and cannot accept another turn")
         turn = None
@@ -259,6 +280,7 @@ class PrimaryAgent:
         skill_started = False
         turn_error = ""
         try:
+            await self._flush_subagent_results_locked()
             if self.hooks is not None:
                 await self.hooks.dispatch(LifecycleEvent.TURN_START, HookContext(message=text))
             if self.skill_service is not None:
@@ -323,6 +345,11 @@ class PrimaryAgent:
                 announced_calls: set[str] = set()
                 reasoning_status_started = False
                 prompt, tools = self._sample_context()
+                subagent_catalog = None
+                subagent_prompt = ""
+                if self.subagent_service is not None:
+                    subagent_catalog = await self.subagent_service.repository.snapshot_for_request()
+                    subagent_prompt = build_subagent_catalog_prompt(subagent_catalog)
                 hooks = self.hooks
                 if hooks is not None:
                     await hooks.dispatch(LifecycleEvent.PRE_SEND, HookContext(message=text))
@@ -334,6 +361,7 @@ class PrimaryAgent:
                     preparation = await self.context_manager.prepare_before_request(
                         current_suffix=self.manager.snapshot_staged(turn),
                         mcp_prompt=prompt,
+                        subagent_prompt=subagent_prompt,
                         hook_prompt=hook_batch.text if hook_batch else "",
                         skill_prompt=skill_prompt,
                         tools=tools,
@@ -356,6 +384,7 @@ class PrimaryAgent:
                 snapshot = self.context_window.snapshot(
                     mcp_prompt=prompt,
                     project_instructions=self.project_instructions,
+                    subagent_prompt=subagent_prompt,
                     hook_prompt=hook_batch.text if hook_batch else "",
                     skill_prompt=skill_prompt,
                     memory_prompt=memory_prompt,
@@ -374,6 +403,19 @@ class PrimaryAgent:
                     snapshot.tools,
                     self.max_output_tokens,
                 )
+                if self.subagent_service is not None and subagent_catalog is not None:
+                    self.subagent_service.bind_request(
+                        ParentRequestSnapshot(
+                            subagent_catalog,
+                            snapshot.system_prompt,
+                            snapshot.messages,
+                            snapshot.tools,
+                            frozenset(tool.name for tool in snapshot.tools),
+                            self.system_prompt,
+                            self.project_instructions,
+                            prompt,
+                        )
+                    )
                 if hook_batch is not None and hooks is not None:
                     hooks.commit_prompt(hook_batch)
                 self.manager.record_usage(
@@ -476,38 +518,73 @@ class PrimaryAgent:
                 )
                 if observation is not None and observation.completed:
                     self._previous_skill_observation = observation
+            if self.subagent_service is not None:
+                self.subagent_service.clear_request()
             if self.manager.conversation and turn is not None:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_turn(turn.id))
             if self.hooks is not None:
                 await self.hooks.dispatch(
                     LifecycleEvent.TURN_END, HookContext(message=text, error=turn_error)
                 )
+            await self._flush_subagent_results_locked()
 
     async def _finish(self, *, cancel_memory: bool) -> None:
         async with self._finalization_lock:
             if self._closed:
                 return
-            if self.hooks is not None:
-                await self.hooks.dispatch(LifecycleEvent.SESSION_END)
-                if cancel_memory:
-                    await self.hooks.cancel()
-                else:
-                    await self.hooks.drain()
-            if self.memory_service is not None:
-                if cancel_memory:
-                    await self.memory_service.cancel()
-                else:
-                    await self.memory_service.drain()
-            if self.skill_evolution is not None:
-                if cancel_memory:
-                    await self.skill_evolution.cancel()
-                else:
-                    await self.skill_evolution.drain()
-            if self.session_coordinator is not None:
-                await self.session_coordinator.close()
-            if self.runtime is not None:
-                await asyncio.to_thread(self.runtime.cleanup)
-            self._closed = True
+            async with self._lifecycle_lock:
+                if self.subagent_tasks is not None:
+                    await self.subagent_tasks.cancel_all(close=True, discard_results=False)
+                    await self._flush_subagent_results_locked()
+                if self.hooks is not None:
+                    await self.hooks.dispatch(LifecycleEvent.SESSION_END)
+                    if cancel_memory:
+                        await self.hooks.cancel()
+                    else:
+                        await self.hooks.drain()
+                if self.memory_service is not None:
+                    if cancel_memory:
+                        await self.memory_service.cancel()
+                    else:
+                        await self.memory_service.drain()
+                if self.skill_evolution is not None:
+                    if cancel_memory:
+                        await self.skill_evolution.cancel()
+                    else:
+                        await self.skill_evolution.drain()
+                if self.session_coordinator is not None:
+                    await self.session_coordinator.close()
+                if self.runtime is not None:
+                    await asyncio.to_thread(self.runtime.cleanup)
+                self._closed = True
+
+    async def _flush_subagent_results(self) -> None:
+        """Persist one atomic batch of completed background results between main turns."""
+        if self.subagent_tasks is None:
+            return
+        async with self._lifecycle_lock:
+            await self._flush_subagent_results_locked()
+
+    async def _flush_subagent_results_locked(self) -> None:
+        """Flush one batch while the caller owns ``_lifecycle_lock``."""
+        if self.subagent_tasks is None:
+            return
+        items = await self.subagent_tasks.take_completed()
+        if not items:
+            return
+        try:
+            messages = self.manager.append_completed_runtime_turn(
+                format_background_results(items), "Subagent results recorded."
+            )
+        except Exception:
+            await self.subagent_tasks.requeue_front(items)
+            raise
+        if self.session_coordinator is not None:
+            await self.session_coordinator.append_turn(messages, completed=True)
+        if self.memory_service is not None and not (
+            self.session_coordinator and self.session_coordinator.persistence_degraded
+        ):
+            self.memory_service.maybe_schedule()
 
     def _sample_context(self) -> tuple[str, tuple]:
         return (

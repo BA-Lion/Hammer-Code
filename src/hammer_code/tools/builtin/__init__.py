@@ -1,6 +1,7 @@
 """Built-in workspace-scoped tools, including progressive Skill loading."""
 
 from hammer_code.skill.tool import UseSkillTool
+from hammer_code.subagent.tool import RunSubagentTool, SubagentTaskTool
 from hammer_code.tools.builtin.discovery import ToolSearchTool
 from hammer_code.tools.builtin.files import CreateFileTool, EditFileTool, ReadFileTool
 from hammer_code.tools.builtin.search import GlobTool, GrepTool
@@ -12,7 +13,9 @@ __all__ = [
     "GlobTool",
     "GrepTool",
     "ReadFileTool",
+    "RunSubagentTool",
     "ShellTool",
     "ToolSearchTool",
+    "SubagentTaskTool",
     "UseSkillTool",
 ]

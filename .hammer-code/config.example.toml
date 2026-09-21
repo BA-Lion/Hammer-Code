@@ -30,6 +30,12 @@ prune_min_retrieve = 20
 prune_min_relevant = 10
 prune_relevant_used_ratio = 5.0
 
+# Predefined Subagents are read from .hammer-code/subagents/*.md. These bounds
+# apply to their in-process runs; no real Subagent definitions are created here.
+[subagent]
+default_max_iterations = 20
+max_background_tasks = 4
+
 # Local context-budget estimates, not provider-reported token usage.
 [context]
 tool_result_overflow_tokens = 5000

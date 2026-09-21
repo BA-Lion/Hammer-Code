@@ -28,6 +28,9 @@ from hammer_code.session.session import Session, SessionCoordinator
 from hammer_code.skill.evolution import SkillEvolutionService
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.skill.service import SkillInvocationService
+from hammer_code.subagent.repository import SubagentRepository
+from hammer_code.subagent.runner import SubagentRunner
+from hammer_code.subagent.service import BackgroundTaskManager, SubagentService
 from hammer_code.tools.base import ToolExecutionContext
 from hammer_code.tools.builtin.shell import sanitized_environment
 from hammer_code.tools.executor import ToolExecutor
@@ -61,6 +64,7 @@ class PrimaryAgentFactory:
         memory_store: MemoryStore,
         maintenance_lock: asyncio.Lock,
         skill_repository: SkillRepository | None = None,
+        subagent_repository: SubagentRepository | None = None,
         project_instructions: str = "",
         show_reasoning: bool = False,
         hook_definitions: tuple[HookDefinitionConfig, ...] = (),
@@ -78,6 +82,7 @@ class PrimaryAgentFactory:
         self.memory_store = memory_store
         self.maintenance_lock = maintenance_lock
         self.skill_repository = skill_repository
+        self.subagent_repository = subagent_repository
         self.project_instructions = project_instructions
         self.show_reasoning = show_reasoning
         self.hook_definitions = hook_definitions
@@ -139,12 +144,19 @@ class PrimaryAgentFactory:
             if self.skill_repository is not None
             else None
         )
+        subagent_tasks = BackgroundTaskManager(self.config.subagent)
+        subagent_service = (
+            SubagentService(self.subagent_repository, self.config.subagent, subagent_tasks)
+            if self.subagent_repository is not None
+            else None
+        )
         execution_context = ToolExecutionContext(
             self.workspace_root,
             self.cwd,
             runtime.session_dir,
             sanitized_environment(),
             skill_service,
+            subagent_service,
         )
         hooks = HookManager(
             instantiate_hooks(self.hook_definitions), self.permissions, execution_context, self.ui
@@ -193,6 +205,18 @@ class PrimaryAgentFactory:
             if self.skill_repository is not None
             else None
         )
+        if subagent_service is not None:
+            subagent_service.bind_runtime(
+                SubagentRunner(
+                    self.client,
+                    runtime,
+                    self.resolved.profile.max_output_tokens,
+                    self.permissions,
+                    manager.record_maintenance_usage,
+                ),
+                self.registry,
+                execution_context,
+            )
         return PrimaryAgent(
             manager,
             self.client,
@@ -215,6 +239,8 @@ class PrimaryAgentFactory:
             skill_service,
             evolution,
             hooks,
+            subagent_tasks,
+            subagent_service,
         )
 
     def _prompt(self, mode: object) -> str:

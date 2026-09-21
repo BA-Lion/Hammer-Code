@@ -7,11 +7,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel
 
 from hammer_code.domain.events import ToolDefinition
+
+if TYPE_CHECKING:
+    from hammer_code.subagent.tool import RunSubagentArguments, SubagentTaskArguments
 
 
 class ToolCategory(StrEnum):
@@ -31,6 +34,14 @@ class SkillInvocationPort(Protocol):
     async def invoke(self, name: str, arguments: str) -> ToolExecutionResult: ...
 
 
+class SubagentInvocationPort(Protocol):
+    """Per-Agent bridge used by the Subagent tools during an active main turn."""
+
+    async def invoke(self, arguments: RunSubagentArguments) -> ToolExecutionResult: ...
+
+    async def task(self, arguments: SubagentTaskArguments) -> ToolExecutionResult: ...
+
+
 @dataclass(frozen=True)
 class ToolExecutionContext:
     workspace_root: Path
@@ -38,6 +49,7 @@ class ToolExecutionContext:
     runtime_dir: Path
     sanitized_env: Mapping[str, str]
     skill_invoker: SkillInvocationPort | None = None
+    subagent_invoker: SubagentInvocationPort | None = None
 
 
 @dataclass(frozen=True)

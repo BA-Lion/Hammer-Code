@@ -28,6 +28,18 @@ max_retries = 0
 
 `default_profile` 必须引用已有的 `[profiles.<名称>]`。profile 名称不可为空。
 
+## Subagent
+
+预定义 Subagent 从 `.hammer-code/subagents/*.md` 读取；目录不存在时是正常的空 catalog，不会阻止动态 Subagent。只允许当前目录的直接 `.md` 文件，且不会自动创建任何定义。
+
+```toml
+[subagent]
+default_max_iterations = 20 # 1–50
+max_background_tasks = 4    # 1–16
+```
+
+这两个数值分别限制单次 Subagent 的模型/工具循环，以及每个会话中运行、等待审批或尚未写入结果的后台任务总数。它们不会授予工具权限，也不会启用 worktree、Agent Team 或跨进程恢复。定义格式、调用方式、审批和后台结果说明见 [Subagent 使用指南](subagents.md)。
+
 ## Skill 与自进化
 
 Skill 相关目录位于项目内 `.hammer-code/skill/`，并被 Git 忽略。省略 `[skill]` 时，代码默认启用本地 Skill 发现/调用、但默认关闭 Evolution；不存在 Skill 目录等同于空 catalog，不会在启动时自动创建第一个 Skill。

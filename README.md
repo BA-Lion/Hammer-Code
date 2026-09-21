@@ -131,5 +131,10 @@ python -m uv build
 本地工具、MCP stdio/Streamable HTTP Client、延迟工具发现、上下文压缩、Primary Agent、
 运行中 Session 切换与 Rich CLI。
 
+已实现的 Subagent 可从 `.hammer-code/subagents/*.md` 严格加载，支持 predefined/dynamic、
+isolated/fork 和 inline/background 组合。调用与任务查询使用 `run_subagent`、`subagent_task`；
+后台终态以普通合成 Session 轮次保存，权限仍由当前 PermissionService 控制。详见
+`.ai/doc/subagent/execution-and-results.md`。
+
 未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、
-通用 Subagent、Agent Team 和跨 profile/protocol 的运行中切换。
+Agent Team 和跨 profile/protocol 的运行中切换。

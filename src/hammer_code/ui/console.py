@@ -15,6 +15,7 @@ from hammer_code.domain.events import CompactEvent
 from hammer_code.domain.messages import ReasoningVisibility, ToolCallBlock
 from hammer_code.domain.usage import UsageSummary
 from hammer_code.permissions.models import ApprovalChoice, PermissionRequest
+from hammer_code.ui.interaction import InteractionCoordinator
 
 _STREAM_FLUSH_CELLS = 32
 
@@ -48,6 +49,7 @@ class ConsoleUI:
         self._stream_line_open = False
         self._stream_buffer = ""
         self._stream_style: str | None = None
+        self._interaction = InteractionCoordinator()
 
     def _finish_thinking(self) -> None:
         if self._thinking_status is not None:
@@ -112,7 +114,7 @@ class ConsoleUI:
 
     async def prompt(self) -> str:
         self._begin_block()
-        return await asyncio.to_thread(input, "hammer> ")
+        return await self._interaction.read(lambda: asyncio.to_thread(input, "hammer> "))
 
     def text_delta(self, text: str) -> None:
         self._stream_text(text)
@@ -146,7 +148,9 @@ class ConsoleUI:
         )
         while True:
             try:
-                answer = (await asyncio.to_thread(input, prompt)).strip()
+                answer = (
+                    await self._interaction.read(lambda: asyncio.to_thread(input, prompt))
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 return ApprovalChoice.DENY
             match answer:
@@ -161,7 +165,9 @@ class ConsoleUI:
     async def confirm(self, prompt: str) -> bool:
         self._begin_block()
         try:
-            answer = await asyncio.to_thread(input, f"{prompt} [y/N] ")
+            answer = await self._interaction.read(
+                lambda: asyncio.to_thread(input, f"{prompt} [y/N] ")
+            )
         except (EOFError, KeyboardInterrupt):
             return False
         return answer.strip().lower() in {"y", "yes"}
@@ -173,7 +179,9 @@ class ConsoleUI:
         lines = "  ".join(f"{index + 1}) {option}" for index, option in enumerate(options))
         while True:
             try:
-                answer = await asyncio.to_thread(input, f"{prompt}\n{lines}\nSelect [1]: ")
+                answer = await self._interaction.read(
+                    lambda: asyncio.to_thread(input, f"{prompt}\n{lines}\nSelect [1]: ")
+                )
             except (EOFError, KeyboardInterrupt):
                 return None
             normalized = answer.strip()

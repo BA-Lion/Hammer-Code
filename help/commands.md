@@ -123,7 +123,7 @@ thinking_budget = 1024
 | `/feedback <name|scope:name> <feedback>` | 对指定 Skill 提交维护反馈；仅 Evolution 启用且权限允许自动写入时可用。 |
 | `/exit` | 关闭客户端并退出。 |
 
-空输入会被忽略。普通模型 Tool Call 会先经过本地参数校验、路径/命令策略和 PermissionService；未公开、已禁用、无效或未获授权的调用不会执行。`/skill`、`/feedback` 与模型 `use_skill` 的完整说明见 [Skill 使用指南](skills.md)。
+空输入会被忽略。普通模型 Tool Call 会先经过本地参数校验、路径/命令策略和 PermissionService；未公开、已禁用、无效或未获授权的调用不会执行。`/skill`、`/feedback` 与模型 `use_skill` 的完整说明见 [Skill 使用指南](skills.md)。Subagent 没有 slash 命令：在普通对话中说明需要委派、后台执行、列出、查看或取消任务，模型会在当前轮次内使用受控工具；完整说明见 [Subagent 使用指南](subagents.md)。
 
 ## 开发验证与构建
 

@@ -93,6 +93,21 @@ class ConversationManager:
             raise ConversationError("Create a conversation before recording usage")
         self.conversation.usage_ledger.upsert(request_id, operation_id, usage)
 
+    def append_completed_runtime_turn(
+        self, user_text: str, assistant_text: str
+    ) -> tuple[Message, Message]:
+        """Append one complete local text turn without opening a model transaction."""
+        if self.conversation is None:
+            raise ConversationError("Create a conversation before appending a runtime turn")
+        if self._active_turn is not None:
+            raise ConversationBusyError("Cannot append a runtime turn during an active turn")
+        if not user_text.strip() or not assistant_text.strip():
+            raise ConversationError("Runtime turn messages must not be empty")
+        user = Message(Role.USER, (TextBlock(user_text),))
+        assistant = Message(Role.ASSISTANT, (TextBlock(assistant_text),))
+        self.conversation.messages.extend((user, assistant))
+        return user, assistant
+
     def record_usage(self, turn: TurnTransaction, request_id: str, usage: TokenUsage) -> None:
         self._assert_active(turn)
         assert self.conversation is not None

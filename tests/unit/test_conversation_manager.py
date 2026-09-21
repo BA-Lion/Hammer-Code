@@ -55,6 +55,21 @@ def test_single_active_turn_and_clear() -> None:
     manager.clear()
 
 
+def test_runtime_turn_appends_one_complete_text_pair_without_an_active_turn() -> None:
+    manager = ConversationManager()
+    manager.create(_resolved())
+
+    user, assistant = manager.append_completed_runtime_turn("runtime result", "recorded")
+
+    assert user.role is Role.USER
+    assert assistant.role is Role.ASSISTANT
+    assert manager.snapshot_committed() == (user, assistant)
+    turn = manager.begin_turn("next")
+    with pytest.raises(ConversationBusyError):
+        manager.append_completed_runtime_turn("other", "other")
+    manager.abort(turn)
+
+
 def test_interrupted_turn_keeps_complete_tool_exchange() -> None:
     manager = ConversationManager()
     manager.create(_resolved())
