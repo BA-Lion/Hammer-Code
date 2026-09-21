@@ -15,7 +15,7 @@ from hammer_code.subagent.repository import SubagentRepository, SubagentReposito
 if TYPE_CHECKING:
     from hammer_code.subagent.runner import SubagentRunner
     from hammer_code.subagent.service import BackgroundTaskManager, SubagentService
-    from hammer_code.subagent.tool import RunSubagentTool, SubagentTaskTool
+    from hammer_code.subagent.tool import RunSubagentTool
 
 __all__ = [
     "BackgroundTaskStatus",
@@ -30,7 +30,6 @@ __all__ = [
     "SubagentRunner",
     "SubagentService",
     "SubagentSource",
-    "SubagentTaskTool",
 ]
 
 
@@ -46,8 +45,8 @@ def __getattr__(name: str) -> object:
         return {"BackgroundTaskManager": BackgroundTaskManager, "SubagentService": SubagentService}[
             name
         ]
-    if name in {"RunSubagentTool", "SubagentTaskTool"}:
-        from hammer_code.subagent.tool import RunSubagentTool, SubagentTaskTool
+    if name == "RunSubagentTool":
+        from hammer_code.subagent.tool import RunSubagentTool
 
-        return {"RunSubagentTool": RunSubagentTool, "SubagentTaskTool": SubagentTaskTool}[name]
+        return RunSubagentTool
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

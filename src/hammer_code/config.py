@@ -193,6 +193,7 @@ class SubagentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     default_max_iterations: int = Field(default=20, ge=1, le=50)
     max_background_tasks: int = Field(default=4, ge=1, le=16)
+    max_task_tokens: int = Field(default=200_000, ge=1_000, le=10_000_000)
 
 
 class McpBaseConfig(BaseModel):

@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.domain.events import (
     ModelRequest,
     ResponseCompleted,
@@ -20,6 +21,7 @@ from hammer_code.llm.client import ModelClient
 from hammer_code.permissions.service import ApprovalPort, PermissionService
 from hammer_code.subagent.models import SubagentContext, SubagentInvocation
 from hammer_code.subagent.prompts import build_subagent_system
+from hammer_code.subagent.usage import SubagentUsageTracker
 from hammer_code.tools.base import ToolExecutionContext, ToolExecutionResult
 from hammer_code.tools.executor import ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
@@ -37,18 +39,22 @@ class SubagentRunner:
         max_output_tokens: int,
         permissions: PermissionService,
         record_usage: Callable[[str, str, TokenUsage], None],
+        estimator: TokenEstimator | None = None,
     ) -> None:
         self.client = client
         self.runtime = runtime
         self.max_output_tokens = max_output_tokens
         self.permissions = permissions
         self.record_usage = record_usage
+        self.estimator = estimator or TokenEstimator()
 
     async def run(
         self,
         invocation: SubagentInvocation,
         registry: ToolRegistry,
         context: ToolExecutionContext,
+        operation_id: str,
+        usage_tracker: SubagentUsageTracker,
         approval_port: ApprovalPort | None = None,
     ) -> ToolExecutionResult:
         prefix = (
@@ -77,18 +83,28 @@ class SubagentRunner:
         )
         executor = ToolExecutor(registry, child_permissions, child_context, self.runtime)
         calls = unknown = 0
-        operation_id = f"subagent-{uuid4()}"
         for _ in range(invocation.max_iterations):
             request_id = str(uuid4())
             completed: ResponseCompleted | None = None
             announced: set[str] = set()
+            system_prompt = build_subagent_system(prefix, definition)
+            tool_definitions = registry.definitions()
+            request_messages = tuple(messages)
+            estimated_input = self.estimator.estimate_request(
+                system_prompt, request_messages, tool_definitions
+            )
+            allowed_max_output = usage_tracker.reserve(
+                request_id, estimated_input, self.max_output_tokens
+            )
+            if allowed_max_output is None:
+                return ToolExecutionResult("Error: Subagent token budget exhausted.", True)
             request = ModelRequest(
                 request_id,
                 operation_id,
-                build_subagent_system(prefix, definition),
-                tuple(messages),
-                registry.definitions(),
-                self.max_output_tokens,
+                system_prompt,
+                request_messages,
+                tool_definitions,
+                allowed_max_output,
             )
             try:
                 async for event in self.client.stream(request):
@@ -103,10 +119,12 @@ class SubagentRunner:
                             )
                         completed = event
                         self.record_usage(operation_id, request_id, event.response.usage)
+                        usage_tracker.observe(request_id, event.response.usage)
                     elif isinstance(event, ToolCallCompleted):
                         announced.add(event.tool_call.call_id)
                     elif isinstance(event, UsageUpdated):
                         self.record_usage(operation_id, request_id, event.usage)
+                        usage_tracker.observe(request_id, event.usage)
             except Exception:
                 return ToolExecutionResult("Error: Subagent model request failed.", True)
             if completed is None:
@@ -142,6 +160,8 @@ class SubagentRunner:
                     "Error: Subagent made too many unknown tool calls.", True
                 )
             messages.append(Message(Role.USER, results))
+            if usage_tracker.snapshot().exhausted:
+                return ToolExecutionResult("Error: Subagent token budget exhausted.", True)
         return ToolExecutionResult("Error: Subagent iteration limit reached.", True)
 
 

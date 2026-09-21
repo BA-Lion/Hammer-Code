@@ -72,7 +72,7 @@ def test_cli_builds_a_no_tool_prompt_for_chat_loop(
     assert f"Project root: {config_path.parent.parent.resolve()}" in prompt
     assert "Enabled tools: create_file, edit_file, glob, grep, read_file" in prompt
     assert "run_subagent" in prompt
-    assert "subagent_task" in prompt
+    assert "subagent_task" not in prompt
     assert "permissions are checked separately" in prompt
 
 

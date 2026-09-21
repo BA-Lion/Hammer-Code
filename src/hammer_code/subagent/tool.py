@@ -1,8 +1,6 @@
-"""Model-facing Subagent invocation and task-inspection tool contracts."""
+"""Model-facing Subagent invocation contract."""
 
 from __future__ import annotations
-
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -39,24 +37,17 @@ class RunSubagentArguments(BaseModel):
         return self
 
 
-class SubagentTaskArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    action: Literal["list", "get", "cancel"]
-    task_id: str | None = Field(default=None, min_length=1, max_length=36)
-
-    @model_validator(mode="after")
-    def _shape(self) -> SubagentTaskArguments:
-        if (self.action == "list") != (self.task_id is None):
-            raise ValueError("list must not include task_id; get and cancel require task_id")
-        return self
-
-
 class RunSubagentTool(Tool):
     name = "run_subagent"
-    description = "Run one predefined or dynamic bounded Subagent for a complete task."
+    description = (
+        "Run one bounded Subagent. Use inline when the current answer needs the result; "
+        "multiple inline calls in one tool batch run concurrently. Use background only to "
+        "start detached work whose result will be delivered on a later user turn; do not wait "
+        "or poll for it in the current turn."
+    )
     input_model = RunSubagentArguments
     category = ToolCategory.READ
-    concurrency_policy = ConcurrencyPolicy.SERIAL
+    concurrency_policy = ConcurrencyPolicy.PARALLEL_READ
 
     async def execute(
         self, context: ToolExecutionContext, arguments: BaseModel
@@ -66,20 +57,3 @@ class RunSubagentTool(Tool):
         if not isinstance(arguments, RunSubagentArguments):
             return ToolExecutionResult("Error: Subagent arguments are invalid.", True)
         return await context.subagent_invoker.invoke(arguments)
-
-
-class SubagentTaskTool(Tool):
-    name = "subagent_task"
-    description = "List, inspect, or cancel Subagent tasks created in the current Session."
-    input_model = SubagentTaskArguments
-    category = ToolCategory.READ
-    concurrency_policy = ConcurrencyPolicy.SERIAL
-
-    async def execute(
-        self, context: ToolExecutionContext, arguments: BaseModel
-    ) -> ToolExecutionResult:
-        if context.subagent_invoker is None:
-            return ToolExecutionResult("Error: Subagent task management is unavailable.", True)
-        if not isinstance(arguments, SubagentTaskArguments):
-            return ToolExecutionResult("Error: Subagent task arguments are invalid.", True)
-        return await context.subagent_invoker.task(arguments)

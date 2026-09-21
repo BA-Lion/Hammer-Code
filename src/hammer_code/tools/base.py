@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from hammer_code.domain.events import ToolDefinition
 
 if TYPE_CHECKING:
-    from hammer_code.subagent.tool import RunSubagentArguments, SubagentTaskArguments
+    from hammer_code.subagent.tool import RunSubagentArguments
 
 
 class ToolCategory(StrEnum):
@@ -38,8 +38,6 @@ class SubagentInvocationPort(Protocol):
     """Per-Agent bridge used by the Subagent tools during an active main turn."""
 
     async def invoke(self, arguments: RunSubagentArguments) -> ToolExecutionResult: ...
-
-    async def task(self, arguments: SubagentTaskArguments) -> ToolExecutionResult: ...
 
 
 @dataclass(frozen=True)

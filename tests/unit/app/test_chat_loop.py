@@ -6,7 +6,7 @@ import pytest
 from hammer_code.app.agent import PrimaryAgent
 from hammer_code.app.context_manager import ContextPreparation
 from hammer_code.app.context_window import ContextWindow
-from hammer_code.config import AppConfig, resolve_profile
+from hammer_code.config import AppConfig, SubagentConfig, resolve_profile
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import (
     ModelEvent,
@@ -32,6 +32,8 @@ from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import TransportError
 from hammer_code.llm.client import ClientCapabilities, ModelClient
 from hammer_code.permissions.models import ApprovalChoice
+from hammer_code.subagent.service import BackgroundTaskManager
+from hammer_code.tools.base import ToolExecutionResult
 from hammer_code.tools.builtin.files import ReadFileTool
 from hammer_code.tools.executor import ToolBatchCancelled
 from hammer_code.tools.registry import ToolRegistry
@@ -190,6 +192,40 @@ class _FailedCompactionPersistence:
 
     async def rewrite_after_compaction(self, *args, **kwargs) -> None:
         self.persistence_degraded = True
+
+
+@pytest.mark.asyncio
+async def test_background_result_is_not_visible_to_active_turn_and_flush_has_no_usage_text() -> (
+    None
+):
+    manager = _manager()
+    tasks = BackgroundTaskManager(SubagentConfig())
+
+    async def operation(_task) -> ToolExecutionResult:
+        return ToolExecutionResult("background result")
+
+    task = await tasks.start("review", "work", operation)
+    await tasks.wait_idle()
+    assert (await tasks.get(task.id)).status.value == "completed"
+
+    active = manager.begin_turn("active request")
+    active_messages = manager.snapshot_for_request(active)
+    assert all("background result" not in str(message) for message in active_messages)
+    manager.abort(active)
+
+    agent = PrimaryAgent(manager, FakeClient(), FakeUI(), "system", 5, subagent_tasks=tasks)
+    await agent._flush_subagent_results()
+    persisted = manager.snapshot_committed()
+    rendered = "\n".join(str(message) for message in persisted)
+    assert "background result" in rendered
+    assert "reported_total" not in rendered
+    assert "accounted_tokens" not in rendered
+
+    next_turn = manager.begin_turn("next request")
+    assert "background result" in "\n".join(
+        str(message) for message in manager.snapshot_for_request(next_turn)
+    )
+    manager.abort(next_turn)
 
 
 @pytest.mark.asyncio

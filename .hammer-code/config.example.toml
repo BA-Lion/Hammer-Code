@@ -35,6 +35,10 @@ prune_relevant_used_ratio = 5.0
 [subagent]
 default_max_iterations = 20
 max_background_tasks = 4
+# Application-side budget for each inline or background invocation. This uses
+# provider usage when available and conservative local estimates otherwise; it
+# is not an absolute provider billing limit for an already-started request.
+max_task_tokens = 200000
 
 # Local context-budget estimates, not provider-reported token usage.
 [context]

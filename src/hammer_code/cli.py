@@ -33,7 +33,6 @@ from hammer_code.tools.builtin import (
     ReadFileTool,
     RunSubagentTool,
     ShellTool,
-    SubagentTaskTool,
     ToolSearchTool,
 )
 from hammer_code.tools.registry import ToolRegistry
@@ -95,7 +94,6 @@ async def _run(args: argparse.Namespace) -> int:
             ShellTool(),
             UseSkillTool(),
             RunSubagentTool(),
-            SubagentTaskTool(),
         ):
             registry.register(tool)
         rules = RuleStore(workspace_root)

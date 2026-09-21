@@ -42,6 +42,7 @@ from hammer_code.subagent.prompts import build_subagent_catalog_prompt
 from hammer_code.subagent.service import (
     BackgroundTaskManager,
     SubagentService,
+    SubagentTaskSnapshot,
     format_background_results,
 )
 from hammer_code.tools.executor import ToolBatchCancelled, ToolExecutor
@@ -264,6 +265,27 @@ class PrimaryAgent:
             raise HammerCodeError("Skill feedback is unavailable")
         await self.skill_evolution.feedback(name, feedback)
         self.ui.info("Skill feedback queued for controlled maintenance.")
+
+    async def list_subagent_tasks(self) -> tuple[SubagentTaskSnapshot, ...]:
+        if self.subagent_tasks is None:
+            raise HammerCodeError("Subagent task management is unavailable")
+        return await self.subagent_tasks.list()
+
+    async def get_subagent_task(self, task_id: str) -> SubagentTaskSnapshot:
+        if self.subagent_tasks is None:
+            raise HammerCodeError("Subagent task management is unavailable")
+        try:
+            return await self.subagent_tasks.get(task_id)
+        except ValueError as exc:
+            raise HammerCodeError(str(exc)) from exc
+
+    async def cancel_subagent_task(self, task_id: str) -> SubagentTaskSnapshot:
+        if self.subagent_tasks is None:
+            raise HammerCodeError("Subagent task management is unavailable")
+        try:
+            return await self.subagent_tasks.cancel(task_id)
+        except ValueError as exc:
+            raise HammerCodeError(str(exc)) from exc
 
     async def run_turn(self, text: str, skill: tuple[str, str] | None = None) -> None:
         async with self._lifecycle_lock:

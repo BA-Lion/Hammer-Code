@@ -8,6 +8,7 @@ from hammer_code.domain.messages import ToolCallBlock
 from hammer_code.permissions.checker import PermissionChecker
 from hammer_code.permissions.models import ApprovalChoice, PermissionMode, PermissionRequest
 from hammer_code.permissions.service import PermissionService
+from hammer_code.subagent.tool import RunSubagentTool
 from hammer_code.tools.base import (
     ConcurrencyPolicy,
     Tool,
@@ -46,6 +47,22 @@ class SlowReadTool(Tool):
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("The test tool must be cancelled")
+
+
+class BarrierSubagentInvoker:
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.release = asyncio.Event()
+
+    async def invoke(self, arguments) -> ToolExecutionResult:
+        self.started.append(arguments.task)
+        if len(self.started) == 2:
+            self.release.set()
+        await self.release.wait()
+        return ToolExecutionResult(
+            "failed" if arguments.task == "fail" else f"done:{arguments.task}",
+            arguments.task == "fail",
+        )
 
 
 @pytest.mark.asyncio
@@ -99,5 +116,47 @@ async def test_cancelled_batch_returns_a_result_for_every_call(tmp_path: Path) -
             await task
         assert [result.call_id for result in cancelled.value.results] == ["one", "two"]
         assert all(result.is_error for result in cancelled.value.results)
+    finally:
+        runtime.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_multiple_inline_subagents_start_concurrently_and_keep_call_order(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RunSubagentTool())
+    runtime = RuntimeStore(tmp_path)
+    invoker = BarrierSubagentInvoker()
+    try:
+        executor = ToolExecutor(
+            registry,
+            PermissionService(PermissionChecker(PermissionMode.UNATTENDED), AllowApproval(), None),
+            ToolExecutionContext(
+                tmp_path, tmp_path, runtime.session_dir, {}, subagent_invoker=invoker
+            ),
+            runtime,
+        )
+        calls = (
+            ToolCallBlock(
+                "one",
+                "run_subagent",
+                {"task": "first", "prompt": "p", "execution": "inline"},
+                '{"task":"first","prompt":"p","execution":"inline"}',
+            ),
+            ToolCallBlock(
+                "two",
+                "run_subagent",
+                {"task": "fail", "prompt": "p", "execution": "inline"},
+                '{"task":"fail","prompt":"p","execution":"inline"}',
+            ),
+        )
+
+        results = await asyncio.wait_for(executor.execute_batch(calls), timeout=1)
+
+        assert invoker.started == ["first", "fail"]
+        assert [result.call_id for result in results] == ["one", "two"]
+        assert not results[0].is_error
+        assert results[1].is_error
     finally:
         runtime.cleanup()

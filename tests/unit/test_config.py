@@ -221,8 +221,13 @@ def test_subagent_config_is_bounded_and_defaulted() -> None:
 
     assert SubagentConfig().default_max_iterations == 20
     assert SubagentConfig().max_background_tasks == 4
+    assert SubagentConfig().max_task_tokens == 200_000
     with pytest.raises(ValueError):
         SubagentConfig(default_max_iterations=51)
+    with pytest.raises(ValueError):
+        SubagentConfig(max_task_tokens=999)
+    with pytest.raises(ValueError):
+        SubagentConfig(max_task_tokens=10_000_001)
     config = AppConfig.model_validate(
         {
             "default_profile": "main",
@@ -237,7 +242,18 @@ def test_subagent_config_is_bounded_and_defaulted() -> None:
                     "max_retries": 0,
                 }
             },
-            "subagent": {"default_max_iterations": 5, "max_background_tasks": 2},
+            "subagent": {
+                "default_max_iterations": 5,
+                "max_background_tasks": 2,
+                "max_task_tokens": 123_456,
+            },
         }
     )
     assert config.subagent.default_max_iterations == 5
+    assert config.subagent.max_task_tokens == 123_456
+
+
+def test_deprecated_subagent_task_disabled_name_remains_compatible() -> None:
+    from hammer_code.config import ToolConfig
+
+    assert ToolConfig(disabled=("subagent_task",)).disabled == ("subagent_task",)

@@ -14,6 +14,7 @@ from hammer_code.permissions.models import PermissionMode
 
 if TYPE_CHECKING:
     from hammer_code.app.agent import PrimaryAgent  # type: ignore[reportMissingImports]
+    from hammer_code.subagent.service import SubagentTaskSnapshot
     from hammer_code.ui.console import ConsolePort
 
 
@@ -194,6 +195,14 @@ def register_builtin_commands(registry: CommandRegistry) -> None:
         Command("skill", "Run a local Skill", "/skill <name|scope:name> [arguments]", _skill)
     )
     registry.register(
+        Command(
+            "subagent",
+            "Inspect or cancel background Subagents",
+            "/subagent list|get <id>|cancel <id>",
+            _subagent,
+        )
+    )
+    registry.register(
         Command("feedback", "Improve a Skill", "/feedback <name|scope:name> <feedback>", _feedback)
     )
     registry.register(Command("exit", "Exit Hammer Code", "/exit", _exit, aliases=("quit",)))
@@ -344,6 +353,83 @@ async def _feedback(context: CommandContext, invocation: CommandInvocation) -> C
         raise CommandError("Usage: /feedback <name|scope:name> <feedback>")
     await context.agent.feedback_skill(parts[0], parts[1])
     return CommandOutcome()
+
+
+async def _subagent(context: CommandContext, invocation: CommandInvocation) -> CommandOutcome:
+    parts = invocation.arguments.split()
+    if not parts or parts == ["list"]:
+        items = await context.agent.list_subagent_tasks()
+        if not items:
+            context.ui.info("No Subagent background tasks.")
+            return CommandOutcome()
+        visible = items[-100:]
+        prefix = f"[Showing newest 100 of {len(items)} tasks]\n" if len(items) > 100 else ""
+        context.ui.info(
+            _bounded_subagent_text(
+                prefix + "\n".join(_format_subagent_list_item(item) for item in visible)
+            )
+        )
+        return CommandOutcome()
+    if len(parts) != 2 or parts[0] not in {"get", "cancel"}:
+        raise CommandError("Usage: /subagent list | /subagent get <id> | /subagent cancel <id>")
+    item = (
+        await context.agent.cancel_subagent_task(parts[1])
+        if parts[0] == "cancel"
+        else await context.agent.get_subagent_task(parts[1])
+    )
+    context.ui.info(_format_subagent_detail(item))
+    return CommandOutcome()
+
+
+def _format_subagent_list_item(item: SubagentTaskSnapshot) -> str:
+    usage = item.usage
+    reported = usage.reported_total if usage.reported_total is not None else "unavailable"
+    return (
+        f"{item.id[:8]} agent={item.agent} status={item.status.value} "
+        f"started={item.started_at.isoformat()} reported_total={reported} "
+        f"budget={usage.accounted_tokens}/{usage.limit} "
+        f"estimated={str(usage.estimated).lower()} exhausted={str(usage.exhausted).lower()} "
+        f"exceeded={str(usage.exceeded).lower()}"
+    )
+
+
+def _format_subagent_detail(item: SubagentTaskSnapshot) -> str:
+    usage = item.usage
+    reported = usage.reported_total if usage.reported_total is not None else "unavailable"
+    input_tokens = usage.input_tokens if usage.input_tokens is not None else "unavailable"
+    output_tokens = usage.output_tokens if usage.output_tokens is not None else "unavailable"
+    values = [
+        f"id={item.id}",
+        f"agent={item.agent}",
+        f"status={item.status.value}",
+        f"started_at={item.started_at.isoformat()}",
+        f"ended_at={item.ended_at.isoformat() if item.ended_at else 'unavailable'}",
+        f"task={item.task}",
+        (
+            f"usage input={input_tokens} output={output_tokens} "
+            f"cache_read={usage.cache_read_tokens} cache_write={usage.cache_write_tokens} "
+            f"reasoning={usage.reasoning_tokens} reported_total={reported}"
+        ),
+        (
+            f"requests final={usage.final_requests} partial={usage.partial_requests} "
+            f"unavailable={usage.unavailable_requests}"
+        ),
+        (
+            f"budget accounted={usage.accounted_tokens} limit={usage.limit} "
+            f"estimated={str(usage.estimated).lower()} "
+            f"exhausted={str(usage.exhausted).lower()} "
+            f"exceeded={str(usage.exceeded).lower()}"
+        ),
+    ]
+    if item.result is not None:
+        values.append(f"result={item.result}")
+    if item.error is not None:
+        values.append(f"error={item.error}")
+    return _bounded_subagent_text("\n".join(values))
+
+
+def _bounded_subagent_text(text: str) -> str:
+    return text[:24_000] + ("\n[Subagent output truncated]" if len(text) > 24_000 else "")
 
 
 async def _exit(context: CommandContext, invocation: CommandInvocation) -> CommandOutcome:

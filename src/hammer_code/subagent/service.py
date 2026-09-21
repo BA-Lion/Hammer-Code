@@ -23,7 +23,8 @@ from hammer_code.subagent.models import (
 )
 from hammer_code.subagent.repository import SubagentRepository
 from hammer_code.subagent.runner import SubagentRunner
-from hammer_code.subagent.tool import RunSubagentArguments, SubagentTaskArguments
+from hammer_code.subagent.tool import RunSubagentArguments
+from hammer_code.subagent.usage import SubagentUsageSnapshot, SubagentUsageTracker
 from hammer_code.tools.base import ToolExecutionContext, ToolExecutionResult
 from hammer_code.tools.registry import ToolRegistry
 
@@ -35,11 +36,27 @@ class BackgroundTask:
     task: str
     status: BackgroundTaskStatus
     started_at: datetime
+    operation_id: str
+    usage_tracker: SubagentUsageTracker
     ended_at: datetime | None = None
     result: str | None = None
     error: str | None = None
     result_drained: bool = False
     handle: asyncio.Task[ToolExecutionResult] | None = None
+    finished: asyncio.Event | None = None
+
+
+@dataclass(frozen=True)
+class SubagentTaskSnapshot:
+    id: str
+    agent: str
+    task: str
+    status: BackgroundTaskStatus
+    started_at: datetime
+    ended_at: datetime | None
+    result: str | None
+    error: str | None
+    usage: SubagentUsageSnapshot
 
 
 @dataclass(frozen=True)
@@ -108,6 +125,7 @@ class BackgroundTaskManager:
     """Strongly owns background tasks and exposes atomic snapshot-and-drain batches."""
 
     def __init__(self, config: SubagentConfig) -> None:
+        self._config = config
         self._limit = config.max_background_tasks
         self._tasks: dict[str, BackgroundTask] = {}
         self._completed: deque[SubagentFinalResult] = deque()
@@ -126,8 +144,16 @@ class BackgroundTaskManager:
                 raise ValueError("Subagent tasks are no longer accepted")
             if active >= self._limit:
                 raise ValueError("Subagent background task capacity is full")
+            task_id = str(uuid4())
             item = BackgroundTask(
-                str(uuid4()), agent, task[:16000], BackgroundTaskStatus.RUNNING, datetime.now(UTC)
+                id=task_id,
+                agent=agent,
+                task=task[:16000],
+                status=BackgroundTaskStatus.RUNNING,
+                started_at=datetime.now(UTC),
+                operation_id=f"subagent:{task_id}",
+                usage_tracker=SubagentUsageTracker(self._config.max_task_tokens),
+                finished=asyncio.Event(),
             )
             item.handle = asyncio.ensure_future(operation(item))
             self._tasks[item.id] = item
@@ -176,6 +202,8 @@ class BackgroundTaskManager:
             self._completed.append(
                 SubagentFinalResult(item.id, item.agent, status, item.result, item.error)
             )
+            assert item.finished is not None
+            item.finished.set()
 
     async def take_completed(self) -> tuple[SubagentFinalResult, ...]:
         async with self._lock:
@@ -191,33 +219,35 @@ class BackgroundTaskManager:
             for value in items:
                 self._tasks[value.task_id].result_drained = False
 
-    async def list(self) -> tuple[BackgroundTask, ...]:
+    async def list(self) -> tuple[SubagentTaskSnapshot, ...]:
         async with self._lock:
-            return tuple(sorted(self._tasks.values(), key=lambda item: item.started_at))
+            return tuple(
+                self._snapshot(item)
+                for item in sorted(self._tasks.values(), key=lambda item: item.started_at)
+            )
 
-    async def get(self, task_id: str) -> BackgroundTask:
+    async def get(self, task_id: str) -> SubagentTaskSnapshot:
         """Resolve a complete UUID or an unambiguous, at-least-eight-character prefix."""
         normalized = task_id.strip().lower()
         if len(normalized) < 8:
             raise ValueError("Subagent task id prefix must contain at least 8 characters")
         async with self._lock:
-            matches = [
-                item
-                for item in self._tasks.values()
-                if item.id == normalized or item.id.startswith(normalized)
-            ]
-            if len(matches) != 1:
-                raise ValueError("Subagent task id is unknown or ambiguous")
-            return matches[0]
+            return self._snapshot(self._resolve_locked(normalized))
 
-    async def cancel(self, task_id: str) -> BackgroundTask:
-        item = await self.get(task_id)
-        handle = item.handle
+    async def cancel(self, task_id: str) -> SubagentTaskSnapshot:
+        normalized = task_id.strip().lower()
+        if len(normalized) < 8:
+            raise ValueError("Subagent task id prefix must contain at least 8 characters")
+        async with self._lock:
+            item = self._resolve_locked(normalized)
+            handle = item.handle
+            finished = item.finished
         if handle is not None and not handle.done():
             handle.cancel()
             await asyncio.gather(handle, return_exceptions=True)
-            await asyncio.sleep(0)
-        return item
+        if finished is not None:
+            await finished.wait()
+        return await self.get(item.id)
 
     async def wait_idle(self) -> None:
         """Wait for active task bodies and their done callbacks to publish final states."""
@@ -225,8 +255,10 @@ class BackgroundTaskManager:
             handles = tuple(item.handle for item in self._tasks.values() if item.handle)
         if handles:
             await asyncio.gather(*handles, return_exceptions=True)
-        # Done callbacks schedule `_finish`; one loop turn makes their state transition observable.
-        await asyncio.sleep(0)
+        async with self._lock:
+            finished = tuple(item.finished for item in self._tasks.values() if item.finished)
+        if finished:
+            await asyncio.gather(*(event.wait() for event in finished))
 
     async def cancel_all(self, *, close: bool, discard_results: bool) -> None:
         async with self._lock:
@@ -240,16 +272,43 @@ class BackgroundTaskManager:
                 handle.cancel()
         if handles:
             await asyncio.gather(*handles, return_exceptions=True)
-            await asyncio.sleep(0)
+        async with self._lock:
+            finished = tuple(item.finished for item in self._tasks.values() if item.finished)
+        if finished:
+            await asyncio.gather(*(event.wait() for event in finished))
         if discard_results:
             async with self._lock:
                 self._completed.clear()
                 for item in self._tasks.values():
                     item.result_drained = True
 
+    def _resolve_locked(self, normalized: str) -> BackgroundTask:
+        matches = [
+            item
+            for item in self._tasks.values()
+            if item.id == normalized or item.id.startswith(normalized)
+        ]
+        if len(matches) != 1:
+            raise ValueError("Subagent task id is unknown or ambiguous")
+        return matches[0]
+
+    @staticmethod
+    def _snapshot(item: BackgroundTask) -> SubagentTaskSnapshot:
+        return SubagentTaskSnapshot(
+            id=item.id,
+            agent=item.agent,
+            task=item.task[:500],
+            status=item.status,
+            started_at=item.started_at,
+            ended_at=item.ended_at,
+            result=item.result[:20_000] if item.result else None,
+            error=item.error[:500] if item.error else None,
+            usage=item.usage_tracker.snapshot(),
+        )
+
 
 class SubagentService:
-    """Binds exactly one primary request snapshot and exposes the two built-in tools."""
+    """Binds one primary request snapshot to the model-facing invocation tool."""
 
     def __init__(
         self, repository: SubagentRepository, config: SubagentConfig, tasks: BackgroundTaskManager
@@ -303,10 +362,13 @@ class SubagentService:
             return ToolExecutionResult(f"Error: {exc}", True)
 
         async def inline_operation() -> ToolExecutionResult:
+            tracker = SubagentUsageTracker(self.config.max_task_tokens)
             return await runner.run(
                 invocation,
                 registry,
                 context,
+                f"subagent:inline:{uuid4()}",
+                tracker,
                 SubagentApprovalPort(runner.permissions.approvals, agent=invocation.name),
             )
 
@@ -317,6 +379,8 @@ class SubagentService:
                     invocation,
                     registry,
                     context,
+                    item.operation_id,
+                    item.usage_tracker,
                     SubagentApprovalPort(
                         runner.permissions.approvals,
                         agent=invocation.name,
@@ -333,48 +397,6 @@ class SubagentService:
                 return ToolExecutionResult(f"Error: {exc}", True)
             return ToolExecutionResult(f"Subagent task started: {item.id[:8]}")
         return await inline_operation()
-
-    async def task(self, arguments: SubagentTaskArguments) -> ToolExecutionResult:
-        items = await self.tasks.list()
-        if arguments.action == "list":
-            return ToolExecutionResult(
-                json.dumps(
-                    [
-                        {
-                            "id": item.id,
-                            "agent": item.agent,
-                            "status": item.status.value,
-                            "task": item.task[:500],
-                        }
-                        for item in items
-                    ],
-                    ensure_ascii=False,
-                )
-            )
-        assert arguments.task_id is not None
-        try:
-            item = (
-                await self.tasks.cancel(arguments.task_id)
-                if arguments.action == "cancel"
-                else await self.tasks.get(arguments.task_id)
-            )
-        except ValueError as exc:
-            return ToolExecutionResult(f"Error: {exc}", True)
-        return ToolExecutionResult(
-            json.dumps(
-                {
-                    "id": item.id,
-                    "agent": item.agent,
-                    "status": item.status.value,
-                    "started_at": item.started_at.isoformat(),
-                    "ended_at": item.ended_at.isoformat() if item.ended_at else None,
-                    "task": item.task[:500],
-                    "result": item.result[:32000] if item.result else None,
-                    "error": item.error[:500] if item.error else None,
-                },
-                ensure_ascii=False,
-            )
-        )
 
     def _resolve(self, arguments: RunSubagentArguments) -> SubagentInvocation:
         assert self._parent is not None

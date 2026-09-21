@@ -74,8 +74,8 @@ MCP Server 在 CLI 启动后按配置顺序后台连接，单个连接失败不�
 
 启动后，外层交互循环只处理输入、Slash Command 与 Session 生命周期；单个普通轮次由当前
 Primary Agent 执行。可用的本地命令可通过 `/help` 动态查看，包括：`/status`、`/usage`、
-`/clear`、`/compact`、`/permission`、`/session`、`/memory`、`/skill`、`/feedback` 与 `/exit`（`/quit` 是 `/exit` 的
-别名）。命令不会进入对话历史或发送给模型。
+`/clear`、`/compact`、`/permission`、`/session`、`/memory`、`/skill`、`/subagent`、`/feedback`
+与 `/exit`（`/quit` 是 `/exit` 的别名）。命令不会进入对话历史或发送给模型。
 
 `/session list|new|resume <id|latest>|delete <id>` 只在同一启动 profile 和协议内切换；新
 Session 会立即成为当前会话，旧 Session 只在后台完成已经排队的 Memory 维护。删除会再次
@@ -93,6 +93,24 @@ Session 会立即成为当前会话，旧 Session 只在后台完成已经排队
 摘要失败最多重试三次，之后保留会话并安全报错，不会自动清空历史。超大工具结果的临时
 捕获位于 `.hammer-code/tmp/<session-id>/tool-results/`，可在成功摘要后定向清理；`/clear`
 会同时清除内存历史、usage、MCP 已发现工具、恢复线索和当前会话临时结果。
+
+### Subagent
+
+模型只通过 `run_subagent` 启动子任务。`inline` 表示当前回答依赖结果；同一工具批次中的多个
+inline 调用会并发执行，并按原 call id 与调用顺序返回。`background` 只返回启动回执，当前轮次
+不得等待或轮询；终态在固定检查点写入 Session，并从下一次用户普通输入开始进入模型上下文。
+模型没有任务查询或取消工具。
+
+旧配置中的 `tools.disabled = ["subagent_task"]` 仍可解析，但已没有运行时效果，可以删除。
+
+用户可用 `/subagent list`、`/subagent get <id>` 和 `/subagent cancel <id>` 在本地查看或取消当前
+Session 的后台任务；省略子命令等价于 `list`。这些命令不调用模型、不写入 Conversation，也不
+消费待合成的后台结果。任务仅存在当前进程内，重启后不会恢复。
+
+`[subagent].max_task_tokens`（默认 `200000`）统一限制每次 inline/background invocation。每次
+请求前会用本地估算检查输入并收窄 `max_output_tokens`，请求后再以供应商 usage 快照校正；CLI
+分别显示 provider-reported total 与保守的 accounted budget。该限制不是供应商侧原子计费硬限额，
+因此已经开始的单次请求可能因估算误差轻微越界；完整 `END_TURN` 结果仍会保留并标记 exceeded。
 
 ### Skill
 
@@ -132,9 +150,9 @@ python -m uv build
 运行中 Session 切换与 Rich CLI。
 
 已实现的 Subagent 可从 `.hammer-code/subagents/*.md` 严格加载，支持 predefined/dynamic、
-isolated/fork 和 inline/background 组合。调用与任务查询使用 `run_subagent`、`subagent_task`；
-后台终态以普通合成 Session 轮次保存，权限仍由当前 PermissionService 控制。详见
-`.ai/doc/subagent/execution-and-results.md`。
+isolated/fork 和 inline/background 组合。模型只使用 `run_subagent`；后台任务由本地
+`/subagent` 命令管理，终态以普通合成 Session 轮次保存。全部执行受统一任务 Token 预算和当前
+PermissionService 控制。详见 `.ai/doc/subagent/execution-and-results.md`。
 
 未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、
 Agent Team 和跨 profile/protocol 的运行中切换。
