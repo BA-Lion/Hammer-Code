@@ -6,11 +6,12 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from hammer_code.config import SubagentConfig
+from hammer_code.errors import PermissionError
 from hammer_code.permissions.models import ApprovalChoice, PermissionRequest
 from hammer_code.permissions.service import ApprovalPort
 from hammer_code.subagent.models import (
@@ -20,6 +21,7 @@ from hammer_code.subagent.models import (
     SubagentExecution,
     SubagentInvocation,
     SubagentSource,
+    SubagentWorkspace,
 )
 from hammer_code.subagent.repository import SubagentRepository
 from hammer_code.subagent.runner import SubagentRunner
@@ -27,6 +29,11 @@ from hammer_code.subagent.tool import RunSubagentArguments
 from hammer_code.subagent.usage import SubagentUsageSnapshot, SubagentUsageTracker
 from hammer_code.tools.base import ToolExecutionContext, ToolExecutionResult
 from hammer_code.tools.registry import ToolRegistry
+from hammer_code.worktree.manager import WorktreeManager, WorktreeUnavailableError
+from hammer_code.worktree.tool import (
+    InspectSubagentWorktreeArguments,
+    ResolveSubagentWorktreeArguments,
+)
 
 
 @dataclass
@@ -311,15 +318,21 @@ class SubagentService:
     """Binds one primary request snapshot to the model-facing invocation tool."""
 
     def __init__(
-        self, repository: SubagentRepository, config: SubagentConfig, tasks: BackgroundTaskManager
+        self,
+        repository: SubagentRepository,
+        config: SubagentConfig,
+        tasks: BackgroundTaskManager,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self.repository = repository
         self.config = config
         self.tasks = tasks
+        self.worktree_manager = worktree_manager
         self._parent: ParentRequestSnapshot | None = None
         self._runner: SubagentRunner | None = None
         self._registry: ToolRegistry | None = None
         self._context: ToolExecutionContext | None = None
+        self._owned_worktrees: set[str] = set()
 
     def bind_runtime(
         self, runner: SubagentRunner, registry: ToolRegistry, context: ToolExecutionContext
@@ -356,26 +369,37 @@ class SubagentService:
                     )
                 allowed.intersection_update(invocation.allowed_tools)
             allowed.difference_update(invocation.disallowed_tools)
-            allowed.difference_update({"run_subagent", "subagent_task", "use_skill", "toolSearch"})
+            allowed.difference_update(
+                {
+                    "run_subagent",
+                    "subagent_task",
+                    "use_skill",
+                    "toolSearch",
+                    "inspect_subagent_worktree",
+                    "resolve_subagent_worktree",
+                }
+            )
             registry = self._registry.restricted_view(allowed)
         except ValueError as exc:
             return ToolExecutionResult(f"Error: {exc}", True)
 
         async def inline_operation() -> ToolExecutionResult:
             tracker = SubagentUsageTracker(self.config.max_task_tokens)
-            return await runner.run(
+            task_id = str(uuid4())
+            return await self._run_invocation(
                 invocation,
                 registry,
                 context,
-                f"subagent:inline:{uuid4()}",
+                f"subagent:inline:{task_id}",
                 tracker,
                 SubagentApprovalPort(runner.permissions.approvals, agent=invocation.name),
+                task_id,
             )
 
         if invocation.execution is SubagentExecution.BACKGROUND:
 
             async def background_operation(item: BackgroundTask) -> ToolExecutionResult:
-                return await runner.run(
+                return await self._run_invocation(
                     invocation,
                     registry,
                     context,
@@ -387,6 +411,7 @@ class SubagentService:
                         task_id=item.id,
                         tasks=self.tasks,
                     ),
+                    item.id,
                 )
 
             try:
@@ -415,6 +440,7 @@ class SubagentService:
                 definition.disallowed_tools,
                 definition.max_iterations,
                 self._parent,
+                workspace=arguments.workspace or definition.workspace,
             )
         assert arguments.prompt is not None
         return SubagentInvocation(
@@ -428,4 +454,169 @@ class SubagentService:
             (),
             self.config.default_max_iterations,
             self._parent,
+            workspace=arguments.workspace or SubagentWorkspace.SHARED,
+        )
+
+    async def _run_invocation(
+        self,
+        invocation: SubagentInvocation,
+        registry: ToolRegistry,
+        context: ToolExecutionContext,
+        operation_id: str,
+        tracker: SubagentUsageTracker,
+        approval: SubagentApprovalPort,
+        task_id: str,
+    ) -> ToolExecutionResult:
+        assert self._runner is not None
+        lease = None
+        child_context = context
+        if invocation.workspace is SubagentWorkspace.WORKTREE:
+            if self.worktree_manager is None or not self.worktree_manager.available:
+                return ToolExecutionResult("Error: Worktree isolation is unavailable.", True)
+            try:
+                relative = context.cwd.resolve().relative_to(context.workspace_root.resolve())
+                lease = await self.worktree_manager.create(
+                    task_id, relative, self.config.worktree.initialization_files
+                )
+                self._owned_worktrees.add(task_id)
+                child_context = replace(
+                    context,
+                    workspace_root=lease.path,
+                    cwd=(lease.path / lease.relative_cwd).resolve(),
+                    skill_invoker=None,
+                    subagent_invoker=None,
+                    worktree_invoker=None,
+                )
+            except (ValueError, WorktreeUnavailableError):
+                return ToolExecutionResult("Error: Worktree isolation could not be created.", True)
+        try:
+            result = await self._runner.run(
+                invocation, registry, child_context, operation_id, tracker, approval
+            )
+        except asyncio.CancelledError:
+            if lease is not None and self.worktree_manager is not None:
+                await self.worktree_manager.discard(task_id)
+                self._owned_worktrees.discard(task_id)
+            raise
+        if lease is None or self.worktree_manager is None:
+            return result
+        try:
+            metadata = await self.worktree_manager.finalize(task_id)
+        except WorktreeUnavailableError:
+            return ToolExecutionResult("Error: Worktree result could not be finalized.", True)
+        if metadata.change_state == "none":
+            self._owned_worktrees.discard(task_id)
+        payload = {
+            "source": "subagent",
+            "task_id": task_id,
+            "workspace": metadata.workspace.value,
+            "change_state": metadata.change_state,
+            "changed_files": metadata.changed_files,
+            "truncated": metadata.truncated,
+            "result": result.content,
+        }
+        return ToolExecutionResult(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")), result.is_error
+        )
+
+    async def inspect(self, arguments: InspectSubagentWorktreeArguments) -> ToolExecutionResult:
+        if self.worktree_manager is None or arguments.task_id not in self._owned_worktrees:
+            return ToolExecutionResult("Error: Subagent worktree draft is unavailable.", True)
+        try:
+            value = await self.worktree_manager.inspect(
+                arguments.task_id, arguments.detail, arguments.paths
+            )
+        except (ValueError, WorktreeUnavailableError) as exc:
+            return ToolExecutionResult(f"Error: {exc}", True)
+        return ToolExecutionResult(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+    async def resolve(self, arguments: ResolveSubagentWorktreeArguments) -> ToolExecutionResult:
+        if self.worktree_manager is None or arguments.task_id not in self._owned_worktrees:
+            return ToolExecutionResult("Error: Subagent worktree draft is unavailable.", True)
+        try:
+            await self._authorize_resolution(arguments)
+            if arguments.resolution == "discard":
+                value = await self.worktree_manager.discard(arguments.task_id)
+            elif arguments.resolution == "integrate":
+                value = await self.worktree_manager.integrate(arguments.task_id)
+            else:
+                value = await self.worktree_manager.agent_merge(
+                    arguments.task_id,
+                    arguments.inspection_id or "",
+                    tuple(item.model_dump() for item in arguments.edits),
+                )
+        except (PermissionError, ValueError, WorktreeUnavailableError) as exc:
+            return ToolExecutionResult(f"Error: {exc}", True)
+        if value.change_state in {"integrated", "integrated_by_primary", "discarded"}:
+            self._owned_worktrees.discard(arguments.task_id)
+        return ToolExecutionResult(
+            json.dumps(value.__dict__, ensure_ascii=False, default=str, separators=(",", ":")),
+            value.error_code is not None,
+        )
+
+    async def _authorize_resolution(self, arguments: ResolveSubagentWorktreeArguments) -> None:
+        """Re-authorize exact primary paths immediately before a resolution can write."""
+        if arguments.resolution == "discard":
+            return
+        assert self._context is not None and self._runner is not None
+        if arguments.resolution == "agent_merge":
+            paths = tuple(
+                (self._context.workspace_root / item.path).resolve() for item in arguments.edits
+            )
+            actions = tuple(
+                {"path": item.path, "action": item.action, "sha256": item.expected_current_hash}
+                for item in arguments.edits
+            )
+        else:
+            assert self.worktree_manager is not None
+            metadata = self.worktree_manager.metadata(arguments.task_id)
+            paths = tuple(
+                (self._context.workspace_root / path).resolve() for path in metadata.changed_files
+            )
+            actions = tuple(
+                {"path": path, "action": "integrate"} for path in metadata.changed_files
+            )
+        request = PermissionRequest.for_tool(
+            "resolve_subagent_worktree",
+            "write",
+            {"resolution": arguments.resolution, "task_id": arguments.task_id, "actions": actions},
+            paths,
+            self._context.workspace_root,
+            self._context.cwd,
+        )
+        await self._runner.permissions.authorize(request)
+
+    async def discard_worktrees(self) -> None:
+        if self.worktree_manager is None:
+            return
+        for task_id in tuple(self._owned_worktrees):
+            try:
+                await self.worktree_manager.discard(task_id)
+            except WorktreeUnavailableError:
+                pass
+            self._owned_worktrees.discard(task_id)
+
+    def pending_prompt(self) -> str:
+        """Render bounded, local-only facts so a later turn cannot lose pending drafts."""
+        if self.worktree_manager is None or not self._owned_worktrees:
+            return ""
+        items: list[dict[str, object]] = []
+        for task_id in sorted(self._owned_worktrees):
+            try:
+                metadata = self.worktree_manager.metadata(task_id)
+            except WorktreeUnavailableError:
+                continue
+            items.append(
+                {
+                    "task_id": task_id,
+                    "state": metadata.change_state,
+                    "changed_files": metadata.changed_files,
+                    "truncated": metadata.truncated,
+                    "next_action": "inspect_subagent_worktree then resolve_subagent_worktree",
+                }
+            )
+        if not items:
+            return ""
+        return "[Pending Subagent worktree drafts]\n" + json.dumps(
+            items, ensure_ascii=False, separators=(",", ":")
         )

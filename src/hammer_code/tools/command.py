@@ -29,7 +29,7 @@ async def run_powershell(
         "-NonInteractive",
         "-Command",
         command,
-        cwd=context.workspace_root,
+        cwd=context.cwd,
         env=dict(context.sanitized_env),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

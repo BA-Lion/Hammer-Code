@@ -40,6 +40,11 @@ max_background_tasks = 4
 # is not an absolute provider billing limit for an already-started request.
 max_task_tokens = 200000
 
+# Worktree invocations use a fresh Git-only linked worktree. Optionally list
+# specific ignored regular files (never directories or globs) needed to initialize it.
+[subagent.worktree]
+initialization_files = []
+
 # Local context-budget estimates, not provider-reported token usage.
 [context]
 tool_result_overflow_tokens = 5000

@@ -181,6 +181,8 @@ class PrimaryAgent:
         async with self._lifecycle_lock:
             if self.subagent_tasks is not None:
                 await self.subagent_tasks.cancel_all(close=False, discard_results=True)
+            if self.subagent_service is not None:
+                await self.subagent_service.discard_worktrees()
             if self.skill_evolution is not None:
                 await self.skill_evolution.wait_idle()
             if self.memory_service is not None:
@@ -371,7 +373,14 @@ class PrimaryAgent:
                 subagent_prompt = ""
                 if self.subagent_service is not None:
                     subagent_catalog = await self.subagent_service.repository.snapshot_for_request()
-                    subagent_prompt = build_subagent_catalog_prompt(subagent_catalog)
+                    subagent_prompt = "\n\n".join(
+                        piece
+                        for piece in (
+                            build_subagent_catalog_prompt(subagent_catalog),
+                            self.subagent_service.pending_prompt(),
+                        )
+                        if piece
+                    )
                 hooks = self.hooks
                 if hooks is not None:
                     await hooks.dispatch(LifecycleEvent.PRE_SEND, HookContext(message=text))
@@ -557,6 +566,8 @@ class PrimaryAgent:
             async with self._lifecycle_lock:
                 if self.subagent_tasks is not None:
                     await self.subagent_tasks.cancel_all(close=True, discard_results=False)
+                if self.subagent_service is not None:
+                    await self.subagent_service.discard_worktrees()
                     await self._flush_subagent_results_locked()
                 if self.hooks is not None:
                     await self.hooks.dispatch(LifecycleEvent.SESSION_END)

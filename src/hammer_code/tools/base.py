@@ -15,6 +15,10 @@ from hammer_code.domain.events import ToolDefinition
 
 if TYPE_CHECKING:
     from hammer_code.subagent.tool import RunSubagentArguments
+    from hammer_code.worktree.tool import (
+        InspectSubagentWorktreeArguments,
+        ResolveSubagentWorktreeArguments,
+    )
 
 
 class ToolCategory(StrEnum):
@@ -40,6 +44,14 @@ class SubagentInvocationPort(Protocol):
     async def invoke(self, arguments: RunSubagentArguments) -> ToolExecutionResult: ...
 
 
+class SubagentWorktreeInvocationPort(Protocol):
+    """Primary-only bridge for inspecting and resolving its own worktree drafts."""
+
+    async def inspect(self, arguments: InspectSubagentWorktreeArguments) -> ToolExecutionResult: ...
+
+    async def resolve(self, arguments: ResolveSubagentWorktreeArguments) -> ToolExecutionResult: ...
+
+
 @dataclass(frozen=True)
 class ToolExecutionContext:
     workspace_root: Path
@@ -48,6 +60,7 @@ class ToolExecutionContext:
     sanitized_env: Mapping[str, str]
     skill_invoker: SkillInvocationPort | None = None
     subagent_invoker: SubagentInvocationPort | None = None
+    worktree_invoker: SubagentWorktreeInvocationPort | None = None
 
 
 @dataclass(frozen=True)

@@ -26,7 +26,8 @@ def build_subagent_catalog_prompt(snapshot: SubagentCatalogSnapshot) -> str:
             usage = f"; when to use: {definition.when_to_use}" if definition.when_to_use else ""
             lines.append(
                 f"- {definition.name}: {definition.description} "
-                f"(context={definition.context.value}, execution={definition.execution.value})"
+                f"(context={definition.context.value}, execution={definition.execution.value}, "
+                f"workspace={definition.workspace.value})"
                 f"{usage}"
             )
         lines.append("Invoke one by exact name with run_subagent when it helps the current task.")

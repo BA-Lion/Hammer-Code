@@ -101,6 +101,16 @@ inline 调用会并发执行，并按原 call id 与调用顺序返回。`backgr
 不得等待或轮询；终态在固定检查点写入 Session，并从下一次用户普通输入开始进入模型上下文。
 模型没有任务查询或取消工具。
 
+`run_subagent` also accepts `workspace=shared|worktree`; omitted values remain `shared`.
+Every `worktree` invocation receives a fresh detached Git worktree beneath
+`.hammer-code/worktrees/`. Local file, search, Shell, and permission paths use that
+lease's real root and cwd. MCP remains available but is not covered by file isolation.
+Changed child results stay pending until the Primary Agent uses
+`inspect_subagent_worktree` and then `resolve_subagent_worktree` to integrate, provide
+a three-way merge, or discard them. Integration writes only ordinary working-tree files:
+it creates no business commit and does not move HEAD or change the Git index. Pending
+drafts are process-local and are discarded on clear, session switch, or exit.
+
 旧配置中的 `tools.disabled = ["subagent_task"]` 仍可解析，但已没有运行时效果，可以删除。
 
 用户可用 `/subagent list`、`/subagent get <id>` 和 `/subagent cancel <id>` 在本地查看或取消当前

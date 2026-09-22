@@ -37,6 +37,7 @@ from hammer_code.tools.executor import ToolExecutor
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.tools.runtime import RuntimeStore
 from hammer_code.ui.console import ConsolePort
+from hammer_code.worktree.manager import WorktreeManager
 
 
 class AgentFactory(Protocol):
@@ -68,6 +69,7 @@ class PrimaryAgentFactory:
         project_instructions: str = "",
         show_reasoning: bool = False,
         hook_definitions: tuple[HookDefinitionConfig, ...] = (),
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.cwd = cwd.resolve()
@@ -86,6 +88,7 @@ class PrimaryAgentFactory:
         self.project_instructions = project_instructions
         self.show_reasoning = show_reasoning
         self.hook_definitions = hook_definitions
+        self.worktree_manager = worktree_manager
         self._cleanup_old_done = False
 
     async def create_new(self) -> PrimaryAgent:
@@ -146,7 +149,12 @@ class PrimaryAgentFactory:
         )
         subagent_tasks = BackgroundTaskManager(self.config.subagent)
         subagent_service = (
-            SubagentService(self.subagent_repository, self.config.subagent, subagent_tasks)
+            SubagentService(
+                self.subagent_repository,
+                self.config.subagent,
+                subagent_tasks,
+                self.worktree_manager,
+            )
             if self.subagent_repository is not None
             else None
         )
@@ -156,6 +164,7 @@ class PrimaryAgentFactory:
             runtime.session_dir,
             sanitized_environment(),
             skill_service,
+            subagent_service,
             subagent_service,
         )
         hooks = HookManager(

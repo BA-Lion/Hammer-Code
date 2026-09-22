@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from hammer_code.subagent.models import SubagentContext, SubagentExecution
+from hammer_code.subagent.models import SubagentContext, SubagentExecution, SubagentWorkspace
 from hammer_code.tools.base import (
     ConcurrencyPolicy,
     Tool,
@@ -23,6 +23,7 @@ class RunSubagentArguments(BaseModel):
     prompt: str | None = Field(default=None, max_length=32000)
     context: SubagentContext | None = None
     execution: SubagentExecution | None = None
+    workspace: SubagentWorkspace | None = None
 
     @model_validator(mode="after")
     def _shape(self) -> RunSubagentArguments:

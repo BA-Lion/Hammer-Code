@@ -8,7 +8,12 @@ import stat
 from pathlib import Path
 
 from hammer_code.config import SubagentConfig
-from hammer_code.subagent.models import SubagentContext, SubagentDefinition, SubagentExecution
+from hammer_code.subagent.models import (
+    SubagentContext,
+    SubagentDefinition,
+    SubagentExecution,
+    SubagentWorkspace,
+)
 
 _NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _KEYS = {
@@ -17,6 +22,7 @@ _KEYS = {
     "when-to-use",
     "context",
     "execution",
+    "workspace",
     "allowed-tools",
     "disallowed-tools",
     "max-iterations",
@@ -129,6 +135,7 @@ def parse_subagent(path: Path, config: SubagentConfig) -> SubagentDefinition:
     try:
         context = SubagentContext(raw.get("context", SubagentContext.ISOLATED))
         execution = SubagentExecution(raw.get("execution", SubagentExecution.INLINE))
+        workspace = SubagentWorkspace(raw.get("workspace", SubagentWorkspace.SHARED))
     except ValueError as exc:
         raise SubagentParseError("context or execution is invalid") from exc
     max_iterations_raw = raw.get("max-iterations", str(config.default_max_iterations))
@@ -158,4 +165,5 @@ def parse_subagent(path: Path, config: SubagentConfig) -> SubagentDefinition:
         disallowed_tools=disallowed,
         max_iterations=max_iterations,
         source_path=path.resolve(),
+        workspace=workspace,
     )

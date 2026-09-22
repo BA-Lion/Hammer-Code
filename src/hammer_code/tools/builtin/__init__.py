@@ -6,14 +6,17 @@ from hammer_code.tools.builtin.discovery import ToolSearchTool
 from hammer_code.tools.builtin.files import CreateFileTool, EditFileTool, ReadFileTool
 from hammer_code.tools.builtin.search import GlobTool, GrepTool
 from hammer_code.tools.builtin.shell import ShellTool
+from hammer_code.worktree.tool import InspectSubagentWorktreeTool, ResolveSubagentWorktreeTool
 
 __all__ = [
     "CreateFileTool",
     "EditFileTool",
     "GlobTool",
+    "InspectSubagentWorktreeTool",
     "GrepTool",
     "ReadFileTool",
     "RunSubagentTool",
+    "ResolveSubagentWorktreeTool",
     "ShellTool",
     "ToolSearchTool",
     "UseSkillTool",

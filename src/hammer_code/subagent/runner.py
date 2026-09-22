@@ -19,7 +19,8 @@ from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage
 from hammer_code.llm.client import ModelClient
 from hammer_code.permissions.service import ApprovalPort, PermissionService
-from hammer_code.subagent.models import SubagentContext, SubagentInvocation
+from hammer_code.prompts import PromptRuntimeContext, build_system_prompt
+from hammer_code.subagent.models import SubagentContext, SubagentInvocation, SubagentWorkspace
 from hammer_code.subagent.prompts import build_subagent_system
 from hammer_code.subagent.usage import SubagentUsageTracker
 from hammer_code.tools.base import ToolExecutionContext, ToolExecutionResult
@@ -57,25 +58,54 @@ class SubagentRunner:
         usage_tracker: SubagentUsageTracker,
         approval_port: ApprovalPort | None = None,
     ) -> ToolExecutionResult:
+        base_prefix = invocation.parent.base_system_prompt
+        if invocation.workspace is SubagentWorkspace.WORKTREE:
+            base_prefix = build_system_prompt(
+                PromptRuntimeContext(
+                    cwd=context.cwd,
+                    project_root=context.workspace_root,
+                    platform="win32",
+                    shell_backend="PowerShell",
+                    permission_mode="default",
+                    enabled_tools=registry.exposed_names(),
+                )
+            )
         prefix = (
             invocation.parent.system_prompt
             if invocation.context is SubagentContext.FORK
             else "\n\n".join(
                 piece
                 for piece in (
-                    invocation.parent.base_system_prompt,
+                    base_prefix,
                     invocation.parent.project_instructions,
                     invocation.parent.mcp_prompt,
                 )
                 if piece.strip()
             )
         )
+        if (
+            invocation.workspace is SubagentWorkspace.WORKTREE
+            and invocation.context is SubagentContext.FORK
+        ):
+            parent_base = invocation.parent.base_system_prompt
+            if not invocation.parent.system_prompt.startswith(parent_base):
+                return ToolExecutionResult("Subagent parent prompt is not safely reusable.", True)
+            prefix = base_prefix + invocation.parent.system_prompt[len(parent_base) :]
+        if invocation.workspace is SubagentWorkspace.WORKTREE:
+            prefix += (
+                "\n\n[Worktree boundary]\nLocal file, search, Shell, and permission paths use the "
+                "isolated worktree. MCP tools may still affect external systems or the primary "
+                "workspace; those effects are not isolated and are not represented by the "
+                "worktree diff."
+            )
         definition = _definition(invocation)
         messages = list(
             invocation.parent.messages if invocation.context is SubagentContext.FORK else ()
         )
         messages.append(Message(Role.USER, (TextBlock(invocation.task),)))
-        child_context = replace(context, skill_invoker=None, subagent_invoker=None)
+        child_context = replace(
+            context, skill_invoker=None, subagent_invoker=None, worktree_invoker=None
+        )
         child_permissions = PermissionService(
             self.permissions.checker,
             approval_port or self.permissions.approvals,

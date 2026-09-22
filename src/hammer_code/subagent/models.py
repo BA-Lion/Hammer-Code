@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -27,6 +27,11 @@ class SubagentExecution(StrEnum):
     BACKGROUND = "background"
 
 
+class SubagentWorkspace(StrEnum):
+    SHARED = "shared"
+    WORKTREE = "worktree"
+
+
 class BackgroundTaskStatus(StrEnum):
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
@@ -47,6 +52,7 @@ class SubagentDefinition:
     disallowed_tools: tuple[str, ...]
     max_iterations: int
     source_path: Path
+    workspace: SubagentWorkspace = field(default=SubagentWorkspace.SHARED, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -89,3 +95,4 @@ class SubagentInvocation:
     disallowed_tools: tuple[str, ...]
     max_iterations: int
     parent: ParentRequestSnapshot
+    workspace: SubagentWorkspace = field(default=SubagentWorkspace.SHARED, kw_only=True)

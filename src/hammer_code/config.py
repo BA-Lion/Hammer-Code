@@ -33,6 +33,8 @@ BUILTIN_TOOL_NAMES = {
     "use_skill",
     "run_subagent",
     "subagent_task",
+    "inspect_subagent_worktree",
+    "resolve_subagent_worktree",
 }
 McpTransport = Literal["stdio", "streamable_http"]
 _MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -187,6 +189,36 @@ class SkillConfig(BaseModel):
     evolution: SkillEvolutionConfig = SkillEvolutionConfig()
 
 
+class WorktreeConfig(BaseModel):
+    """Opt-in files copied into an otherwise Git-only child worktree."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    initialization_files: tuple[str, ...] = ()
+
+    @field_validator("initialization_files")
+    @classmethod
+    def _initialization_files(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item or "\x00" in item:
+                raise ValueError("initialization_files must contain normalized relative file paths")
+            candidate = item.replace("\\", "/")
+            if (
+                candidate != item
+                or candidate.startswith("/")
+                or ":" in candidate
+                or candidate in {".", ".."}
+                or any(
+                    part in {"", ".", "..", ".git", ".hammer-code"} for part in candidate.split("/")
+                )
+                or any(char in candidate for char in "*?[]")
+            ):
+                raise ValueError("initialization_files must contain normalized relative file paths")
+            if candidate not in normalized:
+                normalized.append(candidate)
+        return tuple(normalized)
+
+
 class SubagentConfig(BaseModel):
     """Bounded controls for in-process Subagent execution."""
 
@@ -194,6 +226,7 @@ class SubagentConfig(BaseModel):
     default_max_iterations: int = Field(default=20, ge=1, le=50)
     max_background_tasks: int = Field(default=4, ge=1, le=16)
     max_task_tokens: int = Field(default=200_000, ge=1_000, le=10_000_000)
+    worktree: WorktreeConfig = WorktreeConfig()
 
 
 class McpBaseConfig(BaseModel):

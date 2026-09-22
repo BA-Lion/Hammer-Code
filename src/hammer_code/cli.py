@@ -30,13 +30,16 @@ from hammer_code.tools.builtin import (
     EditFileTool,
     GlobTool,
     GrepTool,
+    InspectSubagentWorktreeTool,
     ReadFileTool,
+    ResolveSubagentWorktreeTool,
     RunSubagentTool,
     ShellTool,
     ToolSearchTool,
 )
 from hammer_code.tools.registry import ToolRegistry
 from hammer_code.ui.console import ConsoleUI
+from hammer_code.worktree.manager import WorktreeManager
 
 
 def parser() -> argparse.ArgumentParser:
@@ -63,6 +66,7 @@ async def _run(args: argparse.Namespace) -> int:
     ui = ConsoleUI()
     client = None
     mcp_manager = None
+    worktree_manager = None
     try:
         path = discover_config(args.config)
         config = load_config(path)
@@ -94,6 +98,8 @@ async def _run(args: argparse.Namespace) -> int:
             ShellTool(),
             UseSkillTool(),
             RunSubagentTool(),
+            InspectSubagentWorktreeTool(),
+            ResolveSubagentWorktreeTool(),
         ):
             registry.register(tool)
         rules = RuleStore(workspace_root)
@@ -106,6 +112,8 @@ async def _run(args: argparse.Namespace) -> int:
             workspace_root, config.subagent, getattr(ui, "skill_warning", lambda _: None)
         )
         await subagent_repository.initialize()
+        worktree_manager = WorktreeManager(workspace_root)
+        await worktree_manager.initialize()
         try:
             await skill_repository.initialize()
         except Exception:
@@ -129,6 +137,7 @@ async def _run(args: argparse.Namespace) -> int:
             project_instructions=ProjectInstructionLoader(workspace_root).load(),
             show_reasoning=config.ui.show_reasoning,
             hook_definitions=hook_definitions,
+            worktree_manager=worktree_manager,
         )
         resume_id = getattr(args, "resume", None)
         current = await (factory.resume(resume_id) if resume_id else factory.create_new())
@@ -143,6 +152,8 @@ async def _run(args: argparse.Namespace) -> int:
                 await client.aclose()
             except Exception:
                 pass
+        if worktree_manager is not None:
+            await worktree_manager.close()
         ui.error(str(exc))
         return 2
     except OSError:
@@ -156,6 +167,8 @@ async def _run(args: argparse.Namespace) -> int:
                 await client.aclose()
             except Exception:
                 pass
+        if worktree_manager is not None:
+            await worktree_manager.close()
         ui.error("Unable to resolve the project runtime paths.")
         return 2
     ui.banner(
@@ -173,6 +186,8 @@ async def _run(args: argparse.Namespace) -> int:
         try:
             await mcp_manager.close()
         finally:
+            if worktree_manager is not None:
+                await worktree_manager.close()
             await client.aclose()
     return 0
 

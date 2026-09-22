@@ -70,7 +70,17 @@ def test_cli_builds_a_no_tool_prompt_for_chat_loop(
     assert asyncio.run(cli._run(Namespace(config=None, profile=None))) == 0
     prompt = captured["system_prompt"]
     assert f"Project root: {config_path.parent.parent.resolve()}" in prompt
-    assert "Enabled tools: create_file, edit_file, glob, grep, read_file" in prompt
+    assert "Enabled tools:" in prompt
+    for name in (
+        "create_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "inspect_subagent_worktree",
+        "read_file",
+        "resolve_subagent_worktree",
+    ):
+        assert name in prompt
     assert "run_subagent" in prompt
     assert "subagent_task" not in prompt
     assert "permissions are checked separately" in prompt

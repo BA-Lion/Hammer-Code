@@ -12,6 +12,7 @@ build/
 .hammer-code/config.toml
 .hammer-code/hooks.toml
 .hammer-code/runtime/
+/.hammer-code/worktrees/
 .hammer-code/tmp/
 /.hammer-code/sessions/
 /.hammer-code/memory/
