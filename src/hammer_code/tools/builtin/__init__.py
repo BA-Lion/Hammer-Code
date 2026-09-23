@@ -1,5 +1,6 @@
 """Built-in workspace-scoped tools, including progressive Skill loading."""
 
+from hammer_code.agent_team.tool import CreateAgentTeamTool, GetAgentTeamsTool, RunAgentTeamTool
 from hammer_code.skill.tool import UseSkillTool
 from hammer_code.subagent.tool import RunSubagentTool
 from hammer_code.tools.builtin.discovery import ToolSearchTool
@@ -10,12 +11,15 @@ from hammer_code.worktree.tool import InspectSubagentWorktreeTool, ResolveSubage
 
 __all__ = [
     "CreateFileTool",
+    "CreateAgentTeamTool",
     "EditFileTool",
     "GlobTool",
     "InspectSubagentWorktreeTool",
     "GrepTool",
+    "GetAgentTeamsTool",
     "ReadFileTool",
     "RunSubagentTool",
+    "RunAgentTeamTool",
     "ResolveSubagentWorktreeTool",
     "ShellTool",
     "ToolSearchTool",

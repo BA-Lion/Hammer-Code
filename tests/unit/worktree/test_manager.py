@@ -107,3 +107,26 @@ async def test_agent_merge_applies_non_conflicts_and_complete_conflict_decision(
     assert (root / "tracked.txt").read_text(encoding="utf-8") == "merged\n"
     assert (root / "new-child.txt").read_text(encoding="utf-8") == "non-conflicting\n"
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_child_worktree_integrates_only_into_its_parent_then_primary(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    manager = WorktreeManager(root)
+    assert await manager.initialize()
+    parent = await manager.create(str(uuid4()), Path("."))
+    child = await manager.create_child(str(uuid4()), parent.task_id, Path("."))
+    (child.path / "nested.txt").write_text("child result\n", encoding="utf-8")
+
+    child_metadata = await manager.finalize(child.task_id)
+    assert child_metadata.change_state == "pending_integration"
+    child_resolution = await manager.integrate(child.task_id)
+    assert child_resolution.change_state == "integrated"
+    assert (parent.path / "nested.txt").read_text(encoding="utf-8") == "child result\n"
+    assert not (root / "nested.txt").exists()
+
+    parent_metadata = await manager.finalize(parent.task_id)
+    assert parent_metadata.change_state == "pending_integration"
+    assert (await manager.integrate(parent.task_id)).change_state == "integrated"
+    assert (root / "nested.txt").read_text(encoding="utf-8") == "child result\n"
+    await manager.close()

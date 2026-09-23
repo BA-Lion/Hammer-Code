@@ -25,6 +25,7 @@ class WorktreeLease:
     relative_cwd: Path
     created_at: datetime
     state: WorktreeLeaseState
+    parent_task_id: str | None = None
 
 
 @dataclass(frozen=True)

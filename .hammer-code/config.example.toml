@@ -45,6 +45,14 @@ max_task_tokens = 200000
 [subagent.worktree]
 initialization_files = []
 
+# AgentTeams are deliberately disabled by default.  When enabled, reusable
+# definitions live in .hammer-code/agent-teams and transient runs remain under
+# .hammer-code/runtime/agent-teams.
+[agent_team]
+coordination_mode = false
+max_team_tokens = 1000000
+max_active_assignments = 4
+
 # Local context-budget estimates, not provider-reported token usage.
 [context]
 tool_result_overflow_tokens = 5000

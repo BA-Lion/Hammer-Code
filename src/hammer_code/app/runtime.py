@@ -8,6 +8,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+from hammer_code.agent_team.repository import AgentTeamRepository
+from hammer_code.agent_team.runner import AgentTeamRunner
+from hammer_code.agent_team.runtime import AgentTeamRuntimeStore
+from hammer_code.agent_team.service import AgentTeamService
 from hammer_code.app.agent import PrimaryAgent
 from hammer_code.app.context_manager import ContextManager, RecoveryState
 from hammer_code.app.context_window import ContextWindow
@@ -66,6 +70,7 @@ class PrimaryAgentFactory:
         maintenance_lock: asyncio.Lock,
         skill_repository: SkillRepository | None = None,
         subagent_repository: SubagentRepository | None = None,
+        agent_team_repository: AgentTeamRepository | None = None,
         project_instructions: str = "",
         show_reasoning: bool = False,
         hook_definitions: tuple[HookDefinitionConfig, ...] = (),
@@ -85,6 +90,7 @@ class PrimaryAgentFactory:
         self.maintenance_lock = maintenance_lock
         self.skill_repository = skill_repository
         self.subagent_repository = subagent_repository
+        self.agent_team_repository = agent_team_repository
         self.project_instructions = project_instructions
         self.show_reasoning = show_reasoning
         self.hook_definitions = hook_definitions
@@ -158,6 +164,18 @@ class PrimaryAgentFactory:
             if self.subagent_repository is not None
             else None
         )
+        agent_team_service = (
+            AgentTeamService(
+                self.agent_team_repository,
+                self.config.agent_team,
+                self.config.subagent,
+                subagent_tasks,
+                AgentTeamRuntimeStore(self.workspace_root),
+                self.worktree_manager,
+            )
+            if self.agent_team_repository is not None and self.config.agent_team.coordination_mode
+            else None
+        )
         execution_context = ToolExecutionContext(
             self.workspace_root,
             self.cwd,
@@ -166,6 +184,7 @@ class PrimaryAgentFactory:
             skill_service,
             subagent_service,
             subagent_service,
+            agent_team_service,
         )
         hooks = HookManager(
             instantiate_hooks(self.hook_definitions), self.permissions, execution_context, self.ui
@@ -226,6 +245,18 @@ class PrimaryAgentFactory:
                 self.registry,
                 execution_context,
             )
+        if agent_team_service is not None:
+            agent_team_service.bind_runtime(
+                AgentTeamRunner(
+                    self.client,
+                    runtime,
+                    self.resolved.profile.max_output_tokens,
+                    self.permissions,
+                    manager.record_maintenance_usage,
+                ),
+                self.registry,
+                execution_context,
+            )
         return PrimaryAgent(
             manager,
             self.client,
@@ -250,6 +281,7 @@ class PrimaryAgentFactory:
             hooks,
             subagent_tasks,
             subagent_service,
+            agent_team_service,
         )
 
     def _prompt(self, mode: object) -> str:

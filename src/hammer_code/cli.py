@@ -7,6 +7,9 @@ import asyncio
 from pathlib import Path
 from urllib.parse import urlparse
 
+from hammer_code.agent_team.repository import AgentTeamRepository
+from hammer_code.agent_team.runtime import AgentTeamRuntimeStore
+from hammer_code.agent_team.tool import CreateAgentTeamTool, GetAgentTeamsTool, RunAgentTeamTool
 from hammer_code.app.chat_loop import ChatLoop
 from hammer_code.app.commands import CommandRegistry, register_builtin_commands
 from hammer_code.app.runtime import PrimaryAgentFactory
@@ -67,6 +70,7 @@ async def _run(args: argparse.Namespace) -> int:
     client = None
     mcp_manager = None
     worktree_manager = None
+    agent_team_repository = None
     try:
         path = discover_config(args.config)
         config = load_config(path)
@@ -88,6 +92,13 @@ async def _run(args: argparse.Namespace) -> int:
         ):
             raise HammerCodeError("Unattended mode was not confirmed")
         resolved = resolve_profile(config, args.profile)
+        agent_team_enabled = config.agent_team.coordination_mode
+        if agent_team_enabled:
+            try:
+                AgentTeamRuntimeStore(workspace_root).cleanup_orphans()
+            except RuntimeError:
+                agent_team_enabled = False
+                ui.error("AgentTeam runtime cleanup is unsafe; Team coordination is disabled.")
         registry = ToolRegistry(config.tools.disabled)
         for tool in (
             ReadFileTool(),
@@ -102,6 +113,9 @@ async def _run(args: argparse.Namespace) -> int:
             ResolveSubagentWorktreeTool(),
         ):
             registry.register(tool)
+        if agent_team_enabled:
+            for tool in (GetAgentTeamsTool(), CreateAgentTeamTool(), RunAgentTeamTool()):
+                registry.register(tool)
         rules = RuleStore(workspace_root)
         permissions = PermissionService(PermissionChecker(mode, rules), ui, rules)
         client = create_model_client(resolved)
@@ -112,6 +126,11 @@ async def _run(args: argparse.Namespace) -> int:
             workspace_root, config.subagent, getattr(ui, "skill_warning", lambda _: None)
         )
         await subagent_repository.initialize()
+        if agent_team_enabled:
+            agent_team_repository = AgentTeamRepository(
+                workspace_root, getattr(ui, "skill_warning", lambda _: None)
+            )
+            await agent_team_repository.initialize()
         worktree_manager = WorktreeManager(workspace_root)
         await worktree_manager.initialize()
         try:
@@ -134,6 +153,7 @@ async def _run(args: argparse.Namespace) -> int:
             maintenance_lock=asyncio.Lock(),
             skill_repository=skill_repository,
             subagent_repository=subagent_repository,
+            agent_team_repository=agent_team_repository,
             project_instructions=ProjectInstructionLoader(workspace_root).load(),
             show_reasoning=config.ui.show_reasoning,
             hook_definitions=hook_definitions,

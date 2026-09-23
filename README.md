@@ -122,6 +122,25 @@ Session 的后台任务；省略子命令等价于 `list`。这些命令不调�
 分别显示 provider-reported total 与保守的 accounted budget。该限制不是供应商侧原子计费硬限额，
 因此已经开始的单次请求可能因估算误差轻微越界；完整 `END_TURN` 结果仍会保留并标记 exceeded。
 
+### AgentTeam
+
+`[agent_team].coordination_mode` 默认是 `false`。启用后，Primary 才能看到
+`get_agent_teams`、`create_agent_team` 与 `run_agent_team`；长期 Team 定义位于
+`.hammer-code/agent-teams/<team>/config.md`，成员模板位于 `members/*.md`。目录只保存完整
+Leader 身份和可复用模板，不保存运行历史、邮箱、模型对话或凭证。
+
+每次 TeamRun 由 Leader 和可复制的 `Template + Assignment` Runtime 组成。只有 Leader 可以
+创建或更新共享 Task Board；Teammate 只能读取任务、发送/等待 Assignment 邮件并显式结束自身。
+Leader 没有 Shell、普通编辑或文件创建工具；成员的本地工具仍逐次经过既有 PermissionService。
+Leader 只能把 Assignment 子 worktree 整合到 Team 根 worktree，随后仍由 Primary 使用已有
+`inspect_subagent_worktree` / `resolve_subagent_worktree` 将 Team 根草稿整合到主工作区。
+
+Team 的所有 Leader/Assignment 请求共用 `max_team_tokens`，并发请求会原子预留预算；没有轮数
+上限。`inline` 等待 Team 终态，`background` 仅返回启动回执并沿用 `/subagent` 的完成队列；列表
+会显示 `source=agent_team`。运行邮箱和 Task Board 位于被忽略的
+`.hammer-code/runtime/agent-teams/`，在完成、失败、取消或 Session 收尾时删除；进程重启不会恢复
+Team。MCP 副作用不被 Team worktree 隔离。
+
 ### Skill
 
 Skill 默认从项目内 `.hammer-code/skill/project/<folder>/SKILL.md` 与
@@ -164,5 +183,5 @@ isolated/fork 和 inline/background 组合。模型只使用 `run_subagent`；�
 `/subagent` 命令管理，终态以普通合成 Session 轮次保存。全部执行受统一任务 Token 预算和当前
 PermissionService 控制。详见 `.ai/doc/subagent/execution-and-results.md`。
 
-未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查、
-Agent Team 和跨 profile/protocol 的运行中切换。
+未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查与
+跨 profile/protocol 的运行中切换。

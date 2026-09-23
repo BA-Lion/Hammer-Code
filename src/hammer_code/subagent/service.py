@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import cast
 from uuid import uuid4
 
 from hammer_code.config import SubagentConfig
@@ -44,7 +46,8 @@ class BackgroundTask:
     status: BackgroundTaskStatus
     started_at: datetime
     operation_id: str
-    usage_tracker: SubagentUsageTracker
+    usage_tracker: object
+    source: str = "subagent"
     ended_at: datetime | None = None
     result: str | None = None
     error: str | None = None
@@ -64,6 +67,7 @@ class SubagentTaskSnapshot:
     result: str | None
     error: str | None
     usage: SubagentUsageSnapshot
+    source: str = "subagent"
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,7 @@ class SubagentFinalResult:
     status: BackgroundTaskStatus
     result: str | None = None
     error: str | None = None
+    source: str = "subagent"
 
 
 class SubagentApprovalPort:
@@ -114,7 +119,7 @@ def format_background_results(items: tuple[SubagentFinalResult, ...]) -> str:
     ]
     for index, item in enumerate(items, start=1):
         payload: dict[str, str] = {
-            "source": "subagent",
+            "source": item.source,
             "task_id": item.task_id,
             "agent": item.agent,
             "status": item.status.value,
@@ -144,6 +149,9 @@ class BackgroundTaskManager:
         agent: str,
         task: str,
         operation: Callable[[BackgroundTask], Awaitable[ToolExecutionResult]],
+        *,
+        source: str = "subagent",
+        usage_tracker: object | None = None,
     ) -> BackgroundTask:
         async with self._lock:
             active = sum(1 for item in self._tasks.values() if not item.result_drained)
@@ -159,7 +167,8 @@ class BackgroundTaskManager:
                 status=BackgroundTaskStatus.RUNNING,
                 started_at=datetime.now(UTC),
                 operation_id=f"subagent:{task_id}",
-                usage_tracker=SubagentUsageTracker(self._config.max_task_tokens),
+                usage_tracker=usage_tracker or SubagentUsageTracker(self._config.max_task_tokens),
+                source=source,
                 finished=asyncio.Event(),
             )
             item.handle = asyncio.ensure_future(operation(item))
@@ -207,7 +216,9 @@ class BackgroundTaskManager:
             else:
                 item.error = (value.content or "Subagent task cancelled.")[:500]
             self._completed.append(
-                SubagentFinalResult(item.id, item.agent, status, item.result, item.error)
+                SubagentFinalResult(
+                    item.id, item.agent, status, item.result, item.error, item.source
+                )
             )
             assert item.finished is not None
             item.finished.set()
@@ -228,10 +239,8 @@ class BackgroundTaskManager:
 
     async def list(self) -> tuple[SubagentTaskSnapshot, ...]:
         async with self._lock:
-            return tuple(
-                self._snapshot(item)
-                for item in sorted(self._tasks.values(), key=lambda item: item.started_at)
-            )
+            items = tuple(sorted(self._tasks.values(), key=lambda item: item.started_at))
+        return tuple(await asyncio.gather(*(self._snapshot(item) for item in items)))
 
     async def get(self, task_id: str) -> SubagentTaskSnapshot:
         """Resolve a complete UUID or an unambiguous, at-least-eight-character prefix."""
@@ -239,7 +248,8 @@ class BackgroundTaskManager:
         if len(normalized) < 8:
             raise ValueError("Subagent task id prefix must contain at least 8 characters")
         async with self._lock:
-            return self._snapshot(self._resolve_locked(normalized))
+            item = self._resolve_locked(normalized)
+        return await self._snapshot(item)
 
     async def cancel(self, task_id: str) -> SubagentTaskSnapshot:
         normalized = task_id.strip().lower()
@@ -300,7 +310,10 @@ class BackgroundTaskManager:
         return matches[0]
 
     @staticmethod
-    def _snapshot(item: BackgroundTask) -> SubagentTaskSnapshot:
+    async def _snapshot(item: BackgroundTask) -> SubagentTaskSnapshot:
+        usage = item.usage_tracker.snapshot()  # type: ignore[union-attr]
+        if inspect.isawaitable(usage):
+            usage = await usage
         return SubagentTaskSnapshot(
             id=item.id,
             agent=item.agent,
@@ -310,7 +323,8 @@ class BackgroundTaskManager:
             ended_at=item.ended_at,
             result=item.result[:20_000] if item.result else None,
             error=item.error[:500] if item.error else None,
-            usage=item.usage_tracker.snapshot(),
+            usage=usage,
+            source=item.source,
         )
 
 
@@ -404,7 +418,7 @@ class SubagentService:
                     registry,
                     context,
                     item.operation_id,
-                    item.usage_tracker,
+                    cast(SubagentUsageTracker, item.usage_tracker),
                     SubagentApprovalPort(
                         runner.permissions.approvals,
                         agent=invocation.name,
@@ -595,6 +609,14 @@ class SubagentService:
             except WorktreeUnavailableError:
                 pass
             self._owned_worktrees.discard(task_id)
+
+    def adopt_worktree_draft(self, task_id: str) -> None:
+        """Register a verified top-level draft created by another bounded runtime.
+
+        This preserves the existing Primary-only inspect/resolve boundary while
+        allowing AgentTeam's root lease to use the same final integration flow.
+        """
+        self._owned_worktrees.add(task_id)
 
     def pending_prompt(self) -> str:
         """Render bounded, local-only facts so a later turn cannot lose pending drafts."""

@@ -14,6 +14,10 @@ from pydantic import BaseModel
 from hammer_code.domain.events import ToolDefinition
 
 if TYPE_CHECKING:
+    from hammer_code.agent_team.tool import (
+        AgentTeamPrimaryArguments,
+        TeamRuntimeArguments,
+    )
     from hammer_code.subagent.tool import RunSubagentArguments
     from hammer_code.worktree.tool import (
         InspectSubagentWorktreeArguments,
@@ -52,6 +56,18 @@ class SubagentWorktreeInvocationPort(Protocol):
     async def resolve(self, arguments: ResolveSubagentWorktreeArguments) -> ToolExecutionResult: ...
 
 
+class AgentTeamInvocationPort(Protocol):
+    """Primary-only bridge for catalog, create, and run Team tools."""
+
+    async def invoke(self, arguments: AgentTeamPrimaryArguments) -> ToolExecutionResult: ...
+
+
+class TeamRuntimeInvocationPort(Protocol):
+    """Assignment-bound bridge; no call accepts a filesystem or run path."""
+
+    async def invoke(self, arguments: TeamRuntimeArguments) -> ToolExecutionResult: ...
+
+
 @dataclass(frozen=True)
 class ToolExecutionContext:
     workspace_root: Path
@@ -61,6 +77,8 @@ class ToolExecutionContext:
     skill_invoker: SkillInvocationPort | None = None
     subagent_invoker: SubagentInvocationPort | None = None
     worktree_invoker: SubagentWorktreeInvocationPort | None = None
+    agent_team_invoker: AgentTeamInvocationPort | None = None
+    team_runtime_invoker: TeamRuntimeInvocationPort | None = None
 
 
 @dataclass(frozen=True)

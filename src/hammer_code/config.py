@@ -35,6 +35,9 @@ BUILTIN_TOOL_NAMES = {
     "subagent_task",
     "inspect_subagent_worktree",
     "resolve_subagent_worktree",
+    "get_agent_teams",
+    "create_agent_team",
+    "run_agent_team",
 }
 McpTransport = Literal["stdio", "streamable_http"]
 _MCP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -229,6 +232,15 @@ class SubagentConfig(BaseModel):
     worktree: WorktreeConfig = WorktreeConfig()
 
 
+class AgentTeamConfig(BaseModel):
+    """Explicitly opt-in limits for in-process AgentTeam coordination."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    coordination_mode: bool = False
+    max_team_tokens: int = Field(default=1_000_000, ge=10_000, le=50_000_000)
+    max_active_assignments: int = Field(default=4, ge=1, le=16)
+
+
 class McpBaseConfig(BaseModel):
     """Common, secret-free MCP configuration registered before connection."""
 
@@ -335,6 +347,7 @@ class AppConfig(BaseModel):
     context: ContextConfig = ContextConfig()
     skill: SkillConfig = SkillConfig()
     subagent: SubagentConfig = SubagentConfig()
+    agent_team: AgentTeamConfig = AgentTeamConfig()
     mcp: tuple[McpConfig, ...] = ()
 
     @model_validator(mode="after")

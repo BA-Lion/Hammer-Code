@@ -385,7 +385,7 @@ def _format_subagent_list_item(item: SubagentTaskSnapshot) -> str:
     usage = item.usage
     reported = usage.reported_total if usage.reported_total is not None else "unavailable"
     return (
-        f"{item.id[:8]} agent={item.agent} status={item.status.value} "
+        f"{item.id[:8]} source={item.source} agent={item.agent} status={item.status.value} "
         f"started={item.started_at.isoformat()} reported_total={reported} "
         f"budget={usage.accounted_tokens}/{usage.limit} "
         f"estimated={str(usage.estimated).lower()} exhausted={str(usage.exhausted).lower()} "
@@ -400,6 +400,7 @@ def _format_subagent_detail(item: SubagentTaskSnapshot) -> str:
     output_tokens = usage.output_tokens if usage.output_tokens is not None else "unavailable"
     values = [
         f"id={item.id}",
+        f"source={item.source}",
         f"agent={item.agent}",
         f"status={item.status.value}",
         f"started_at={item.started_at.isoformat()}",

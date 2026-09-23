@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import uuid4
 
+from hammer_code.agent_team.prompts import build_agent_team_catalog_prompt
+from hammer_code.agent_team.service import AgentTeamService
 from hammer_code.app.context_manager import ContextManager
 from hammer_code.app.context_window import ContextWindow
 from hammer_code.conversation.manager import ConversationManager
@@ -37,7 +39,7 @@ from hammer_code.skill.models import SkillObservation
 from hammer_code.skill.prompts import build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepositoryError
 from hammer_code.skill.service import SkillInvocationService
-from hammer_code.subagent.models import ParentRequestSnapshot
+from hammer_code.subagent.models import ParentRequestSnapshot, empty_catalog_snapshot
 from hammer_code.subagent.prompts import build_subagent_catalog_prompt
 from hammer_code.subagent.service import (
     BackgroundTaskManager,
@@ -96,6 +98,7 @@ class PrimaryAgent:
         hooks: HookManager | None = None,
         subagent_tasks: BackgroundTaskManager | None = None,
         subagent_service: SubagentService | None = None,
+        agent_team_service: AgentTeamService | None = None,
     ) -> None:
         (
             self.manager,
@@ -121,6 +124,7 @@ class PrimaryAgent:
             self.hooks,
             self.subagent_tasks,
             self.subagent_service,
+            self.agent_team_service,
         ) = (
             manager,
             client,
@@ -145,6 +149,7 @@ class PrimaryAgent:
             hooks,
             subagent_tasks,
             subagent_service,
+            agent_team_service,
         )
         self._accepting_turns = True
         self._closed = False
@@ -183,6 +188,8 @@ class PrimaryAgent:
                 await self.subagent_tasks.cancel_all(close=False, discard_results=True)
             if self.subagent_service is not None:
                 await self.subagent_service.discard_worktrees()
+            if self.agent_team_service is not None:
+                await self.agent_team_service.cancel_all(close=False)
             if self.skill_evolution is not None:
                 await self.skill_evolution.wait_idle()
             if self.memory_service is not None:
@@ -370,6 +377,7 @@ class PrimaryAgent:
                 reasoning_status_started = False
                 prompt, tools = self._sample_context()
                 subagent_catalog = None
+                agent_team_catalog = None
                 subagent_prompt = ""
                 if self.subagent_service is not None:
                     subagent_catalog = await self.subagent_service.repository.snapshot_for_request()
@@ -378,6 +386,18 @@ class PrimaryAgent:
                         for piece in (
                             build_subagent_catalog_prompt(subagent_catalog),
                             self.subagent_service.pending_prompt(),
+                        )
+                        if piece
+                    )
+                if self.agent_team_service is not None:
+                    agent_team_catalog = (
+                        await self.agent_team_service.repository.snapshot_for_request()
+                    )
+                    subagent_prompt = "\n\n".join(
+                        piece
+                        for piece in (
+                            subagent_prompt,
+                            build_agent_team_catalog_prompt(agent_team_catalog),
                         )
                         if piece
                     )
@@ -446,6 +466,22 @@ class PrimaryAgent:
                             self.project_instructions,
                             prompt,
                         )
+                    )
+                if self.agent_team_service is not None and agent_team_catalog is not None:
+                    self.agent_team_service.bind_request(
+                        ParentRequestSnapshot(
+                            subagent_catalog
+                            if subagent_catalog is not None
+                            else empty_catalog_snapshot(),
+                            snapshot.system_prompt,
+                            snapshot.messages,
+                            snapshot.tools,
+                            frozenset(tool.name for tool in snapshot.tools),
+                            self.system_prompt,
+                            self.project_instructions,
+                            prompt,
+                        ),
+                        agent_team_catalog,
                     )
                 if hook_batch is not None and hooks is not None:
                     hooks.commit_prompt(hook_batch)
@@ -551,6 +587,8 @@ class PrimaryAgent:
                     self._previous_skill_observation = observation
             if self.subagent_service is not None:
                 self.subagent_service.clear_request()
+            if self.agent_team_service is not None:
+                self.agent_team_service.clear_request()
             if self.manager.conversation and turn is not None:
                 self.ui.usage(self.manager.conversation.usage_ledger.for_turn(turn.id))
             if self.hooks is not None:
@@ -569,6 +607,8 @@ class PrimaryAgent:
                 if self.subagent_service is not None:
                     await self.subagent_service.discard_worktrees()
                     await self._flush_subagent_results_locked()
+                if self.agent_team_service is not None:
+                    await self.agent_team_service.cancel_all(close=True)
                 if self.hooks is not None:
                     await self.hooks.dispatch(LifecycleEvent.SESSION_END)
                     if cancel_memory:

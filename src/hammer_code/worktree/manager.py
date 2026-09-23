@@ -32,6 +32,8 @@ class WorktreeUnavailableError(RuntimeError):
 @dataclass
 class _Record:
     lease: WorktreeLease
+    integration_root: Path
+    parent_task_id: str | None = None
     result_commit: str | None = None
     changed_files: tuple[str, ...] = ()
     truncated: bool = False
@@ -154,12 +156,73 @@ class WorktreeManager:
             lease = WorktreeLease(
                 task_id, path, baseline, relative, datetime.now(UTC), WorktreeLeaseState.ACTIVE
             )
-            self._records[task_id] = _Record(lease)
+            self._records[task_id] = _Record(lease, self.workspace_root)
+            return lease
+
+    async def create_child(
+        self,
+        task_id: str,
+        parent_task_id: str,
+        relative_cwd: Path,
+        initialization_files: tuple[str, ...] = (),
+    ) -> WorktreeLease:
+        """Create a linked child whose only permitted integration target is its parent.
+
+        The caller supplies opaque IDs only.  Source, target and commit are recovered
+        under the manager lock, so a model cannot redirect a child into another tree.
+        """
+        async with self._lock:
+            self._require_available()
+            if task_id in self._records or not _is_uuid(task_id):
+                raise WorktreeUnavailableError("worktree task id is invalid or already active")
+            parent = self._record(parent_task_id)
+            if (
+                parent.parent_task_id is not None
+                or parent.lease.state is not WorktreeLeaseState.ACTIVE
+            ):
+                raise WorktreeUnavailableError("worktree parent is not an active Team root")
+            if not _contained(parent.lease.path, self._managed_root or self.workspace_root):
+                raise WorktreeUnavailableError("worktree parent is unsafe")
+            relative = Path(".") if relative_cwd == Path(".") else _safe_relative(relative_cwd)
+            baseline = await self._snapshot_commit_locked(parent.lease.path)
+            assert self._managed_root is not None
+            path = (self._managed_root / task_id).resolve()
+            self._assert_managed_path(path)
+            try:
+                await self.git.run(
+                    "worktree", "add", "--detach", str(path), baseline, cwd=self.workspace_root
+                )
+                child_cwd = (path / relative).resolve()
+                if not child_cwd.is_dir() or not _contained(child_cwd, path):
+                    raise WorktreeUnavailableError(
+                        "the requested child working directory is unavailable"
+                    )
+                await self._copy_initialization_files_locked(
+                    path, initialization_files, source_root=parent.lease.path
+                )
+            except Exception:
+                try:
+                    await self._remove_path_locked(path)
+                except Exception:
+                    pass
+                raise
+            lease = WorktreeLease(
+                task_id,
+                path,
+                baseline,
+                relative,
+                datetime.now(UTC),
+                WorktreeLeaseState.ACTIVE,
+                parent_task_id,
+            )
+            self._records[task_id] = _Record(lease, parent.lease.path, parent_task_id)
             return lease
 
     async def finalize(self, task_id: str) -> WorktreeResultMetadata:
         async with self._lock:
             record = self._record(task_id)
+            if record.parent_task_id is None and self._has_active_children(record.lease.task_id):
+                raise WorktreeUnavailableError("children_active")
             if record.lease.state is not WorktreeLeaseState.ACTIVE:
                 return self._metadata(record)
             result = await self._result_commit_locked(record)
@@ -181,6 +244,8 @@ class WorktreeManager:
     async def discard(self, task_id: str) -> WorktreeResolution:
         async with self._lock:
             record = self._record(task_id)
+            if record.parent_task_id is None and self._has_active_children(record.lease.task_id):
+                raise WorktreeUnavailableError("children_active")
             await self._remove_locked(record)
             return WorktreeResolution(task_id, "discarded", False, (), "closed")
 
@@ -212,7 +277,7 @@ class WorktreeManager:
                     "--",
                 ]
                 args.extend(paths)
-                output = await self.git.run(*args, cwd=self.workspace_root)
+                output = await self.git.run(*args, cwd=record.integration_root)
                 return {
                     "task_id": task_id,
                     "detail": "diff",
@@ -262,16 +327,16 @@ class WorktreeManager:
                     "provide every conflict path",
                     "invalid_resolution",
                 )
-            before = await self._main_fingerprints_locked(record.conflicts)
+            before = await self._target_fingerprints_locked(record, record.conflicts)
             targets = tuple(
-                (self.workspace_root / _safe_relative(Path(path))).resolve()
+                (record.integration_root / _safe_relative(Path(path))).resolve()
                 for path in record.changed_files
             )
             backups = {target: _backup(target) for target in targets}
             non_conflicts = tuple(
                 path for path in record.changed_files if path not in record.conflicts
             )
-            index_before = (await self.git.run("write-tree", cwd=self.workspace_root)).stdout
+            index_before = (await self.git.run("write-tree", cwd=record.integration_root)).stdout
             try:
                 if non_conflicts:
                     assert record.result_commit is not None
@@ -285,26 +350,26 @@ class WorktreeManager:
                             record.result_commit,
                             "--",
                             *non_conflicts,
-                            cwd=self.workspace_root,
+                            cwd=record.integration_root,
                         )
                     ).stdout
                     await self.git.run(
                         "apply",
                         "--check",
                         "--whitespace=nowarn",
-                        cwd=self.workspace_root,
+                        cwd=record.integration_root,
                         input_data=patch,
                     )
                     await self.git.run(
                         "apply",
                         "--whitespace=nowarn",
-                        cwd=self.workspace_root,
+                        cwd=record.integration_root,
                         input_data=patch,
                     )
                 for item in edits:
                     path = _safe_relative(Path(str(item["path"])))
-                    target = (self.workspace_root / path).resolve()
-                    if not _contained(target, self.workspace_root):
+                    target = (record.integration_root / path).resolve()
+                    if not _contained(target, record.integration_root):
                         raise ValueError("invalid merge path")
                     expected = str(item.get("expected_current_hash", ""))
                     if before[str(path)] != expected:
@@ -326,7 +391,7 @@ class WorktreeManager:
                         target.write_text(content, encoding="utf-8", newline="")
                     else:
                         raise ValueError("merge action is invalid")
-                index_after = (await self.git.run("write-tree", cwd=self.workspace_root)).stdout
+                index_after = (await self.git.run("write-tree", cwd=record.integration_root)).stdout
                 if index_after != index_before:
                     raise GitError("agent merge unexpectedly changed the index")
             except Exception:
@@ -342,14 +407,16 @@ class WorktreeManager:
                     task_id,
                     "failed",
                     bool(backups),
-                    tuple(str(path.relative_to(self.workspace_root)) for path in backups),
+                    tuple(str(path.relative_to(record.integration_root)) for path in backups),
                     "manual recovery may be required",
                     "failed",
                 )
             await self._remove_locked(record)
             return WorktreeResolution(
                 task_id,
-                "integrated_by_primary",
+                "integrated_by_leader"
+                if record.parent_task_id is not None
+                else "integrated_by_primary",
                 True,
                 record.changed_files,
                 "run relevant verification",
@@ -368,26 +435,17 @@ class WorktreeManager:
             raise WorktreeUnavailableError("worktree draft is unavailable")
         return record
 
-    async def _snapshot_commit_locked(self) -> str:
-        head = (
-            (await self.git.run("rev-parse", "HEAD", cwd=self.workspace_root))
-            .stdout.decode()
-            .strip()
-        )
+    async def _snapshot_commit_locked(self, source_root: Path | None = None) -> str:
+        source = source_root or self.workspace_root
+        head = (await self.git.run("rev-parse", "HEAD", cwd=source)).stdout.decode().strip()
         index = self._temporary_index("snapshot")
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         try:
-            await self.git.run("read-tree", "HEAD", cwd=self.workspace_root, env=env)
-            await self.git.run("add", "-A", cwd=self.workspace_root, env=env)
-            tree = (
-                (await self.git.run("write-tree", cwd=self.workspace_root, env=env))
-                .stdout.decode()
-                .strip()
-            )
+            await self.git.run("read-tree", "HEAD", cwd=source, env=env)
+            await self.git.run("add", "-A", cwd=source, env=env)
+            tree = (await self.git.run("write-tree", cwd=source, env=env)).stdout.decode().strip()
             head_tree = (
-                (await self.git.run("rev-parse", "HEAD^{tree}", cwd=self.workspace_root))
-                .stdout.decode()
-                .strip()
+                (await self.git.run("rev-parse", "HEAD^{tree}", cwd=source)).stdout.decode().strip()
             )
             if tree == head_tree:
                 return head
@@ -400,7 +458,7 @@ class WorktreeManager:
                         head,
                         "-m",
                         "hammer-code worktree snapshot",
-                        cwd=self.workspace_root,
+                        cwd=source,
                         env=env,
                     )
                 )
@@ -500,18 +558,22 @@ class WorktreeManager:
                 "--no-ext-diff",
                 record.lease.baseline_commit,
                 record.result_commit,
-                cwd=self.workspace_root,
+                cwd=record.integration_root,
             )
         ).stdout
-        before_index = (await self.git.run("write-tree", cwd=self.workspace_root)).stdout
+        before_index = (await self.git.run("write-tree", cwd=record.integration_root)).stdout
         try:
             await self.git.run(
-                "apply", "--check", "--whitespace=nowarn", cwd=self.workspace_root, input_data=patch
+                "apply",
+                "--check",
+                "--whitespace=nowarn",
+                cwd=record.integration_root,
+                input_data=patch,
             )
             await self.git.run(
-                "apply", "--whitespace=nowarn", cwd=self.workspace_root, input_data=patch
+                "apply", "--whitespace=nowarn", cwd=record.integration_root, input_data=patch
             )
-            after_index = (await self.git.run("write-tree", cwd=self.workspace_root)).stdout
+            after_index = (await self.git.run("write-tree", cwd=record.integration_root)).stdout
             if before_index != after_index:
                 raise GitError("integration unexpectedly changed the index")
         except GitError:
@@ -537,7 +599,7 @@ class WorktreeManager:
                 record.lease.baseline_commit,
                 "--",
                 path,
-                cwd=self.workspace_root,
+                cwd=record.integration_root,
                 check=False,
             )
             if changed.returncode != 0:
@@ -548,11 +610,11 @@ class WorktreeManager:
         relative = _safe_relative(Path(path))
         return {
             "base": await self._object_text(record.lease.baseline_commit, str(relative)),
-            "current": _file_text(self.workspace_root / relative),
+            "current": _file_text(record.integration_root / relative),
             "result": await self._object_text(
                 record.result_commit or record.lease.baseline_commit, str(relative)
             ),
-            "current_hash": _hash_path(self.workspace_root / relative),
+            "current_hash": _hash_path(record.integration_root / relative),
         }
 
     async def _object_text(self, commit: str, path: str) -> dict[str, object]:
@@ -570,25 +632,30 @@ class WorktreeManager:
         except UnicodeDecodeError:
             return {"state": "binary", "sha256": hashlib.sha256(result.stdout).hexdigest()}
 
-    async def _main_fingerprints_locked(self, paths: tuple[str, ...]) -> dict[str, str]:
+    async def _target_fingerprints_locked(
+        self, record: _Record, paths: tuple[str, ...]
+    ) -> dict[str, str]:
         return {
-            path: _hash_path(self.workspace_root / _safe_relative(Path(path))) for path in paths
+            path: _hash_path(record.integration_root / _safe_relative(Path(path))) for path in paths
         }
 
-    async def _copy_initialization_files_locked(self, child: Path, paths: tuple[str, ...]) -> None:
+    async def _copy_initialization_files_locked(
+        self, child: Path, paths: tuple[str, ...], *, source_root: Path | None = None
+    ) -> None:
+        source_root = source_root or self.workspace_root
         for item in paths:
             relative = _safe_relative(Path(item))
-            source = (self.workspace_root / relative).resolve()
+            source = (source_root / relative).resolve()
             target = (child / relative).resolve()
             if (
-                not _contained(source, self.workspace_root)
+                not _contained(source, source_root)
                 or not _contained(target, child)
                 or not source.is_file()
                 or source.is_symlink()
             ):
                 raise WorktreeUnavailableError("initialization file is unsafe")
             ignored = await self.git.run(
-                "check-ignore", "--quiet", "--", str(relative), cwd=self.workspace_root, check=False
+                "check-ignore", "--quiet", "--", str(relative), cwd=source_root, check=False
             )
             if ignored.returncode != 0:
                 raise WorktreeUnavailableError("initialization file must be ignored")
@@ -644,6 +711,9 @@ class WorktreeManager:
             record.changed_files,
             record.truncated,
         )
+
+    def _has_active_children(self, parent_task_id: str) -> bool:
+        return any(item.parent_task_id == parent_task_id for item in self._records.values())
 
     def _summary(self, record: _Record) -> dict[str, object]:
         return {

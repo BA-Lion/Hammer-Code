@@ -253,6 +253,17 @@ def test_subagent_config_is_bounded_and_defaulted() -> None:
     assert config.subagent.max_task_tokens == 123_456
 
 
+def test_agent_team_config_is_disabled_and_bounded_by_default() -> None:
+    from hammer_code.config import AgentTeamConfig
+
+    assert not AgentTeamConfig().coordination_mode
+    assert AgentTeamConfig().max_team_tokens == 1_000_000
+    with pytest.raises(ValueError):
+        AgentTeamConfig(max_team_tokens=9_999)
+    with pytest.raises(ValueError):
+        AgentTeamConfig(max_active_assignments=17)
+
+
 def test_deprecated_subagent_task_disabled_name_remains_compatible() -> None:
     from hammer_code.config import ToolConfig
 
