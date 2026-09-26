@@ -185,3 +185,17 @@ PermissionService 控制。详见 `.ai/doc/subagent/execution-and-results.md`。
 
 未实现：MCP Resources、Prompts、Sampling、Elicitation、SSE、工具列表订阅、自动重试/健康检查与
 跨 profile/protocol 的运行中切换。
+
+### Skill state v2
+
+完整 Skill 正文只在加载它的当前顶层轮次可见：同轮后续模型请求仍可见，轮次结束后 Conversation 和
+Session 仅保存 scope/name/version 加载回执，下一顶层轮次必须重新调用 `use_skill` 或 `/skill`。
+检索使用轮次开始的 metadata snapshot，调用在首次加载时解析最新发布版本，并在同轮去重。
+
+`record.jsonl` 是不含 Skill body、完整消息和用户原文的事件事实源；`usage.json` v2 可由它重建。
+retrieve/loaded 由程序记录，relevant/applied 由独立 Evaluator 裁决。generated Skill 仅在当前版本最近
+五次已裁决召回持续超过 `prune_unapplied_days`（默认 30）仍未 applied 时可恢复 prune。
+
+通用文件工具会在授权前拒绝 `.hammer-code/skill/`；Memory 仅保留一般只读入口。Shell 只有提示词约束，
+不是 OS 级隔离。首次运行本开发版本会一次性删除不兼容的 `sessions` 和 `skill/state`，并写入 schema
+marker；project/user Skill、history、prune 和 Memory 保留，删除的数据不可恢复。

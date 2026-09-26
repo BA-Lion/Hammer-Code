@@ -12,7 +12,7 @@ from hammer_code.agent_team.prompts import build_agent_team_catalog_prompt
 from hammer_code.agent_team.service import AgentTeamService
 from hammer_code.app.context_manager import ContextManager
 from hammer_code.app.context_window import ContextWindow
-from hammer_code.conversation.manager import ConversationManager
+from hammer_code.conversation.manager import ConversationManager, TurnFinalization, TurnTransaction
 from hammer_code.domain.events import (
     ModelRequest,
     ReasoningDelta,
@@ -35,6 +35,7 @@ from hammer_code.permissions.service import PermissionService
 from hammer_code.prompts import build_stale_restore_prompt
 from hammer_code.session.session import SessionCoordinator
 from hammer_code.skill.evolution import SkillEvolutionService
+from hammer_code.skill.history import project_durable_skill_messages
 from hammer_code.skill.models import SkillObservation
 from hammer_code.skill.prompts import build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepositoryError
@@ -317,6 +318,7 @@ class PrimaryAgent:
             if self.skill_service is not None:
                 try:
                     skill_snapshot = await self.skill_service.repository.snapshot_for_turn()
+                    retrieval_event_ids: tuple[str, ...] = ()
                     if skill is None:
                         index = skill_snapshot.index
                         retrieved = (
@@ -331,22 +333,22 @@ class PrimaryAgent:
                             else ()
                         )
                         if retrieved:
-                            await self.skill_service.repository.record_retrieved(
-                                tuple(item.ref for item in retrieved)
+                            retrieval_event_ids = (
+                                await self.skill_service.repository.record_retrieved(
+                                    tuple(item.ref for item in retrieved),
+                                    catalog_generation=skill_snapshot.generation,
+                                )
                             )
                         skill_prompt = build_skill_request_prompt(skill_snapshot, retrieved)
                     else:
                         retrieved = ()
                     self.skill_service.begin_turn(
-                        skill_snapshot, SkillObservation(skill_snapshot.generation, retrieved)
+                        skill_snapshot,
+                        SkillObservation(skill_snapshot.generation, retrieved),
+                        retrieved_prompt=skill_prompt,
+                        retrieve_event_ids=retrieval_event_ids,
                     )
                     skill_started = True
-                    if self.skill_evolution is not None and skill is None:
-                        self.skill_evolution.schedule(
-                            self.manager.snapshot_committed(),
-                            text,
-                            self._previous_skill_observation,
-                        )
                     if skill is not None:
                         prepared = await self.skill_service.invoke_user(*skill)
                         if prepared.is_fork:
@@ -356,14 +358,17 @@ class PrimaryAgent:
                             turn = self.manager.begin_turn(text)
                             if result.is_error:
                                 self.ui.error(result.content.removeprefix("Error: ").strip())
-                                committed = self.manager.interrupt(turn)
-                                await self._persist_turn_outcome(committed, completed=False)
+                                await self._finalize_turn(turn, text=text, completed=False)
                             else:
                                 self.ui.text_delta(result.content)
-                                committed = self.manager.commit(
-                                    turn, Message(Role.ASSISTANT, (TextBlock(result.content),))
+                                await self._finalize_turn(
+                                    turn,
+                                    text=text,
+                                    completed=True,
+                                    assistant_message=Message(
+                                        Role.ASSISTANT, (TextBlock(result.content),)
+                                    ),
                                 )
-                                await self._persist_turn_outcome(committed, completed=True)
                             return
                         skill_prompt = prepared.prompt
                 except SkillRepositoryError:
@@ -530,8 +535,9 @@ class PrimaryAgent:
                     block for block in response.message.content if isinstance(block, ToolCallBlock)
                 )
                 if response.stop_reason.value != "tool_call":
-                    committed = self.manager.commit(turn, response.message)
-                    await self._persist_turn_outcome(committed, completed=True)
+                    await self._finalize_turn(
+                        turn, text=text, completed=True, assistant_message=response.message
+                    )
                     return
                 if not calls or {call.call_id for call in calls} != announced_calls:
                     raise StreamInterruptedError(
@@ -544,35 +550,30 @@ class PrimaryAgent:
                 if call_count > 200 or unknown_count > 3 or self.executor is None:
                     self.manager.stage_tool_call(turn, response.message)
                     self.ui.error("Tool loop limit reached or tool executor is unavailable")
-                    committed = self.manager.interrupt(turn)
-                    await self._persist_turn_outcome(committed, completed=False)
+                    await self._finalize_turn(turn, text=text, completed=False)
                     return
                 self.manager.stage_tool_call(turn, response.message)
                 results = await self.executor.execute_batch(calls)
                 self.manager.stage_tool_results(turn, Message(Role.USER, tuple(results)))
             self.ui.error("Tool loop request limit reached")
-            committed = self.manager.interrupt(turn)
-            await self._persist_turn_outcome(committed, completed=False)
+            await self._finalize_turn(turn, text=text, completed=False)
         except ToolBatchCancelled as exc:
             turn_error = "tool execution cancelled"
             if turn is not None:
                 self.manager.stage_tool_results(turn, Message(Role.USER, exc.results))
-                committed = self.manager.interrupt(turn)
-                await self._persist_turn_outcome(committed, completed=False)
+                await self._finalize_turn(turn, text=text, completed=False)
             raise asyncio.CancelledError from exc
         except asyncio.CancelledError:
             turn_error = "turn cancelled"
             if turn is not None:
-                committed = self.manager.interrupt(turn)
-                await self._persist_turn_outcome(committed, completed=False)
+                await self._finalize_turn(turn, text=text, completed=False)
             raise
         except Exception as exc:
             turn_error = (
                 str(exc) if isinstance(exc, HammerCodeError) else "unexpected model failure"
             )
             if turn is not None:
-                committed = self.manager.interrupt(turn)
-                await self._persist_turn_outcome(committed, completed=False)
+                await self._finalize_turn(turn, text=text, completed=False)
             self.ui.error(
                 str(exc) if isinstance(exc, HammerCodeError) else "Unexpected model failure"
             )
@@ -687,6 +688,35 @@ class PrimaryAgent:
             return
         if self.memory_service is not None:
             self.memory_service.maybe_schedule()
+
+    async def _finalize_turn(
+        self,
+        turn: TurnTransaction,
+        *,
+        text: str,
+        completed: bool,
+        assistant_message: Message | None = None,
+    ) -> TurnFinalization:
+        """Freeze live history once, then persist precisely its durable projection."""
+
+        def projector(messages: tuple[Message, ...]) -> tuple[Message, ...]:
+            outcomes = self.skill_service.tool_outcomes if self.skill_service else {}
+            return project_durable_skill_messages(messages, outcomes)
+
+        outcome = (
+            self.manager.commit(turn, assistant_message, projector)
+            if completed and assistant_message is not None
+            else self.manager.interrupt(turn, projector)
+        )
+        assert isinstance(outcome, TurnFinalization)
+        await self._persist_turn_outcome(outcome.durable_messages, completed=outcome.completed)
+        if self.skill_service is not None:
+            evidence = self.skill_service.finish_turn_evidence(
+                completed=outcome.completed, live_messages=outcome.live_messages
+            )
+            if evidence is not None and evidence.completed and self.skill_evolution is not None:
+                self.skill_evolution.schedule_evidence(evidence, text)
+        return outcome
 
     async def _persist_preparation(self, before: tuple[Message, ...], preparation: object) -> None:
         if self.session_coordinator is None or not getattr(preparation, "history_replaced", False):

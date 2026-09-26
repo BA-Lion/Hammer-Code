@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -95,19 +95,68 @@ class SkillObservation:
 
 
 @dataclass(frozen=True)
+class LoadedSkill:
+    """One first successful load, retained only until turn adjudication completes."""
+
+    ref: SkillRef
+    body: str
+    invocation_kind: Literal["model", "direct", "fork"]
+    event_id: str
+
+
+@dataclass(frozen=True)
+class SkillLoadOutcome:
+    ref: SkillRef
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
+class SkillTurnEvidence:
+    retrieved: tuple[RetrievedSkill, ...]
+    retrieved_prompt: str
+    loaded: tuple[LoadedSkill, ...]
+    live_messages: tuple[Message, ...]
+    completed: bool
+    retrieve_event_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AdjudicatedRetrieval:
+    retrieve_event_id: str
+    turn_id: str | None
+    retrieved_at: str
+    evaluation_event_id: str
+
+
+@dataclass(frozen=True)
 class UsageEntry:
     source: SkillSource | None = None
     version: str | None = None
+    version_updated_at: str | None = None
     retrieve: int = 0
+    loaded: int = 0
     relevant: int = 0
-    used: int = 0
+    applied: int = 0
     version_retrieve: int = 0
+    version_loaded: int = 0
     version_relevant: int = 0
-    version_used: int = 0
+    version_applied: int = 0
     last_retrieved_at: str | None = None
+    last_loaded_at: str | None = None
     last_relevant_at: str | None = None
-    last_used_at: str | None = None
-    latest_reason: str | None = None
+    last_applied_at: str | None = None
+    version_last_applied_at: str | None = None
+    adjudicated_retrievals: tuple[AdjudicatedRetrieval, ...] = ()
+
+    @property
+    def used(self) -> int:
+        """Compatibility view only; persisted usage v2 exposes ``loaded``."""
+        return self.loaded
+
+    @property
+    def version_used(self) -> int:
+        """Compatibility view only; persisted usage v2 exposes ``version_loaded``."""
+        return self.version_loaded
 
 
 @dataclass(frozen=True)
@@ -117,6 +166,41 @@ class EvolutionQueueItem:
     previous_observation: SkillObservation | None
     update_target_ref: SkillRef | None = None
     feedback: str | None = None
+    evidence: SkillTurnEvidence | None = None
+
+
+class RelevanceEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    scope: SkillScope
+    name: str = Field(pattern=r"[a-z0-9]+(?:-[a-z0-9]+)*")
+    version: str = Field(pattern=r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+    relevant: bool
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        return _one_line(value, "reason", 500)
+
+
+class ApplicationEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    scope: SkillScope
+    name: str = Field(pattern=r"[a-z0-9]+(?:-[a-z0-9]+)*")
+    version: str = Field(pattern=r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+    applied: bool
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        return _one_line(value, "reason", 500)
+
+
+class EvaluatorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    relevance_evaluations: tuple[RelevanceEvaluation, ...] = ()
+    application_evaluations: tuple[ApplicationEvaluation, ...] = ()
 
 
 class SkillEvaluation(BaseModel):
@@ -164,7 +248,6 @@ class ExtractedCandidate(BaseModel):
 
 class ExtractorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    evaluations: tuple[SkillEvaluation, ...] = ()
     candidate_action: str
     candidate: ExtractedCandidate | None = None
     discard_reason: str | None = Field(default=None, max_length=500)

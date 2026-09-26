@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import overload
 from uuid import uuid4
 
 from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock, ToolResultBlock
@@ -25,6 +27,13 @@ class TurnTransaction:
     request_ids: list[str] = field(default_factory=list)
     staged_messages: list[Message] = field(default_factory=list)
     status: TurnStatus = TurnStatus.OPEN
+
+
+@dataclass(frozen=True)
+class TurnFinalization:
+    live_messages: tuple[Message, ...]
+    durable_messages: tuple[Message, ...]
+    completed: bool
 
 
 @dataclass
@@ -115,16 +124,36 @@ class ConversationManager:
             turn.request_ids.append(request_id)
         self.conversation.usage_ledger.upsert(request_id, turn.id, usage)
 
-    def commit(self, turn: TurnTransaction, assistant_message: Message) -> tuple[Message, ...]:
+    @overload
+    def commit(self, turn: TurnTransaction, assistant_message: Message) -> tuple[Message, ...]: ...
+
+    @overload
+    def commit(
+        self,
+        turn: TurnTransaction,
+        assistant_message: Message,
+        projector: Callable[[tuple[Message, ...]], tuple[Message, ...]],
+    ) -> TurnFinalization: ...
+
+    def commit(
+        self,
+        turn: TurnTransaction,
+        assistant_message: Message,
+        projector: Callable[[tuple[Message, ...]], tuple[Message, ...]] | None = None,
+    ) -> tuple[Message, ...] | TurnFinalization:
         self._assert_active(turn)
         if assistant_message.role is not Role.ASSISTANT:
             raise ConversationError("Only an assistant message can be committed")
         assert self.conversation is not None
-        committed = (*turn.staged_messages, assistant_message)
-        self.conversation.messages.extend(committed)
+        live = (*turn.staged_messages, assistant_message)
+        durable = projector(live) if projector is not None else live
+        self._validate_projection(live, durable)
+        self.conversation.messages.extend(durable)
         turn.status = TurnStatus.COMMITTED
         self._active_turn = None
-        return committed
+        if projector is None:
+            return durable
+        return TurnFinalization(live, durable, True)
 
     def abort(self, turn: TurnTransaction) -> None:
         self._assert_active(turn)
@@ -159,7 +188,21 @@ class ConversationManager:
             raise ConversationError("Tool results must exactly match the preceding tool call ids")
         turn.staged_messages.append(user_message)
 
-    def interrupt(self, turn: TurnTransaction) -> tuple[Message, ...]:
+    @overload
+    def interrupt(self, turn: TurnTransaction) -> tuple[Message, ...]: ...
+
+    @overload
+    def interrupt(
+        self,
+        turn: TurnTransaction,
+        projector: Callable[[tuple[Message, ...]], tuple[Message, ...]],
+    ) -> TurnFinalization: ...
+
+    def interrupt(
+        self,
+        turn: TurnTransaction,
+        projector: Callable[[tuple[Message, ...]], tuple[Message, ...]] | None = None,
+    ) -> tuple[Message, ...] | TurnFinalization:
         """Commit complete tool exchanges after an interrupted later model request."""
         self._assert_active(turn)
         has_exchange = any(
@@ -173,13 +216,41 @@ class ConversationManager:
         )
         if not has_exchange:
             self.abort(turn)
-            return ()
+            return () if projector is None else TurnFinalization((), (), False)
         assert self.conversation is not None
-        committed = tuple(turn.staged_messages)
-        self.conversation.messages.extend(committed)
+        live = tuple(turn.staged_messages)
+        durable = projector(live) if projector is not None else live
+        self._validate_projection(live, durable)
+        self.conversation.messages.extend(durable)
         turn.status = TurnStatus.INTERRUPTED
         self._active_turn = None
-        return committed
+        if projector is None:
+            return durable
+        return TurnFinalization(live, durable, False)
+
+    @staticmethod
+    def _validate_projection(live: tuple[Message, ...], durable: tuple[Message, ...]) -> None:
+        if len(live) != len(durable):
+            raise ConversationError("Durable turn projection must preserve message count")
+        for original, projected in zip(live, durable, strict=True):
+            if original.role is not projected.role:
+                raise ConversationError("Durable turn projection must preserve message roles")
+            original_calls = {
+                item.call_id for item in original.content if isinstance(item, ToolCallBlock)
+            }
+            projected_calls = {
+                item.call_id for item in projected.content if isinstance(item, ToolCallBlock)
+            }
+            original_results = {
+                item.call_id for item in original.content if isinstance(item, ToolResultBlock)
+            }
+            projected_results = {
+                item.call_id for item in projected.content if isinstance(item, ToolResultBlock)
+            }
+            if original_calls != projected_calls or original_results != projected_results:
+                raise ConversationError(
+                    "Durable turn projection must preserve tool call/result pairing"
+                )
 
     def restore(
         self, profile_identity: object, messages: tuple[Message, ...], usage_total: int

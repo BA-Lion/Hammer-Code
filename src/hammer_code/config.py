@@ -161,26 +161,11 @@ class SkillEvolutionConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     enabled: bool = False
-    max_history_messages: int = Field(default=8, ge=0, le=64)
-    max_input_tokens: int = Field(default=4000, gt=0)
     max_maintenance_input_tokens: int = Field(default=64000, gt=0)
     merge_candidate_top_k: int = Field(default=10, ge=1, le=50)
-    forced_merge_score: float = Field(default=0.90, gt=0, le=1)
-    forced_merge_margin: float = Field(default=0.10, ge=0, lt=1)
     max_body_chars: int = Field(default=32000, ge=1)
     max_corrections: int = Field(default=2, ge=0, le=5)
-    prune_unused_days: int = Field(default=90, ge=1)
-    prune_min_retrieve: int = Field(default=20, ge=1)
-    prune_min_relevant: int = Field(default=10, ge=1)
-    prune_relevant_used_ratio: float = Field(default=5.0, gt=0)
-
-    @model_validator(mode="after")
-    def _relationships(self) -> SkillEvolutionConfig:
-        if self.forced_merge_margin >= self.forced_merge_score:
-            raise ValueError("forced_merge_margin must be smaller than forced_merge_score")
-        if self.prune_min_relevant > self.prune_min_retrieve:
-            raise ValueError("prune_min_relevant must not exceed prune_min_retrieve")
-        return self
+    prune_unapplied_days: int = Field(default=30, ge=1)
 
 
 class SkillConfig(BaseModel):

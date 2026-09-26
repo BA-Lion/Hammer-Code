@@ -189,6 +189,12 @@ class PrimaryAgentFactory:
         hooks = HookManager(
             instantiate_hooks(self.hook_definitions), self.permissions, execution_context, self.ui
         )
+
+        def observe_tool_result(call: object, arguments: object, raw: object) -> None:
+            context_manager.observe_tool_result(call, arguments, raw)  # type: ignore[arg-type]
+            if skill_service is not None:
+                skill_service.observe_tool_result(call, arguments, raw)  # type: ignore[arg-type]
+
         executor = ToolExecutor(
             self.registry,
             self.permissions,
@@ -196,7 +202,7 @@ class PrimaryAgentFactory:
             runtime,
             self.config.context,
             TokenEstimator(),
-            context_manager.observe_tool_result,
+            observe_tool_result,
             hooks,
         )
         if skill_service is not None:

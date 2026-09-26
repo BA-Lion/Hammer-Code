@@ -80,7 +80,7 @@ def _config() -> SkillConfig:
 
 def _candidate(name: str = "release-check") -> str:
     return (
-        '{"evaluations":[],"candidate_action":"candidate","candidate":'
+        '{"candidate_action":"candidate","candidate":'
         '{"name":"'
         + name
         + '","description":"Reusable release checklist","body":"Check {{arguments}}.",'
@@ -103,10 +103,7 @@ def _add() -> str:
 
 
 def _discard() -> str:
-    return (
-        '{"evaluations":[],"candidate_action":"discard","candidate":null,'
-        '"discard_reason":"one-off"}'
-    )
+    return '{"candidate_action":"discard","candidate":null,"discard_reason":"one-off"}'
 
 
 def _maintenance_discard(reason: str = "Candidate is too narrow") -> str:
@@ -161,7 +158,7 @@ async def test_evolution_uses_bounded_json_correction_without_committing_bad_out
     client = _Client(
         [
             "not json",
-            '{"evaluations":[],"candidate_action":"discard","candidate":null,"discard_reason":"one-off"}',
+            '{"candidate_action":"discard","candidate":null,"discard_reason":"one-off"}',
         ]
     )
     service = SkillEvolutionService(

@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from hammer_code.config import SkillConfig
 from hammer_code.skill.catalog import SkillCatalog, SkillCatalogError
-from hammer_code.skill.models import CatalogSnapshot, SkillDefinition, SkillRef, empty_snapshot
+from hammer_code.skill.models import (
+    ApplicationEvaluation,
+    CatalogSnapshot,
+    RelevanceEvaluation,
+    SkillDefinition,
+    SkillRef,
+    empty_snapshot,
+)
 from hammer_code.skill.store import (
     CommitResult,
     PreparedSkillWrite,
@@ -31,6 +38,7 @@ class SkillRepository:
         self._lock = asyncio.Lock()
         self._state_degraded = False
         self._catalog_unavailable = False
+        self._pending_evaluations: set[SkillRef] = set()
 
     @property
     def state_degraded(self) -> bool:
@@ -42,7 +50,9 @@ class SkillRepository:
             self._current = await asyncio.to_thread(self.catalog.build_snapshot, None)
             self._catalog_unavailable = False
             try:
-                await asyncio.to_thread(self.store.load_usage)
+                await asyncio.to_thread(
+                    self.store.rebuild_usage, self._current.by_identity.values()
+                )
                 self._state_degraded = False
             except SkillStoreError:
                 self._state_degraded = True
@@ -73,35 +83,113 @@ class SkillRepository:
             if definition is None or definition.version != ref.version:
                 raise SkillRepositoryError("Skill identity changed before state update")
 
-    async def record_retrieved(self, refs: tuple[SkillRef, ...]) -> None:
+    async def resolve_latest(self, name: str, *, user: bool, model: bool) -> SkillDefinition:
+        """Resolve at invocation time, never from the turn-start retrieval snapshot."""
+        async with self._lock:
+            try:
+                self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
+                return self.catalog.resolve(self._current, name, user=user, model=model)
+            except SkillCatalogError as exc:
+                self._catalog_unavailable = True
+                raise SkillRepositoryError("Skill catalog is unavailable") from exc
+
+    async def record_retrieved(
+        self,
+        refs: tuple[SkillRef, ...],
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        catalog_generation: int = 0,
+    ) -> tuple[str, ...]:
         async with self._lock:
             self._assert_writable_state()
             try:
-                await self._validate_refs(refs)
-                await asyncio.to_thread(self.store.record_retrieved, refs)
+                event_ids = await asyncio.to_thread(
+                    self.store.record_retrieved,
+                    refs,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    catalog_generation=catalog_generation,
+                )
+                await asyncio.to_thread(
+                    self.store.rebuild_usage, self._current.by_identity.values()
+                )
+                return event_ids
             except SkillStoreError as exc:
                 self._state_degraded = True
                 raise SkillRepositoryError("Skill usage state could not be saved") from exc
 
-    async def record_evaluations(self, items: tuple[tuple[SkillRef, str], ...]) -> None:
+    async def record_loaded(
+        self,
+        ref: SkillRef,
+        *,
+        invocation_kind: str,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        catalog_generation: int = 0,
+    ) -> str:
         async with self._lock:
             self._assert_writable_state()
             try:
-                await self._validate_refs(tuple(ref for ref, _ in items))
-                await asyncio.to_thread(self.store.record_evaluations, items)
+                event_id = await asyncio.to_thread(
+                    self.store.record_loaded,
+                    ref,
+                    invocation_kind=invocation_kind,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    catalog_generation=catalog_generation,
+                )
+                await asyncio.to_thread(
+                    self.store.rebuild_usage, self._current.by_identity.values()
+                )
+                return event_id
+            except SkillStoreError as exc:
+                self._state_degraded = True
+                raise SkillRepositoryError("Skill usage state could not be saved") from exc
+
+    async def record_evaluation(
+        self,
+        relevance: tuple[RelevanceEvaluation, ...],
+        application: tuple[ApplicationEvaluation, ...],
+        *,
+        retrieve_event_ids: tuple[str, ...] = (),
+        loaded_event_ids: tuple[str, ...] = (),
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        failure_stage: str | None = None,
+    ) -> str:
+        async with self._lock:
+            self._assert_writable_state()
+            try:
+                event_id = await asyncio.to_thread(
+                    self.store.record_evaluation,
+                    relevance,
+                    application,
+                    retrieve_event_ids=retrieve_event_ids,
+                    loaded_event_ids=loaded_event_ids,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    failure_stage=failure_stage,
+                )
+                await asyncio.to_thread(
+                    self.store.rebuild_usage, self._current.by_identity.values()
+                )
+                return event_id
             except SkillStoreError as exc:
                 self._state_degraded = True
                 raise SkillRepositoryError("Skill usage state could not be saved") from exc
 
     async def record_used(self, ref: SkillRef) -> None:
+        """Compatibility shim for callers predating the unambiguous loaded signal."""
+        await self.record_loaded(ref, invocation_kind="legacy")
+
+    async def reserve_evaluation(self, refs: tuple[SkillRef, ...]) -> None:
         async with self._lock:
-            self._assert_writable_state()
-            try:
-                await self._validate_refs((ref,))
-                await asyncio.to_thread(self.store.record_used, ref)
-            except SkillStoreError as exc:
-                self._state_degraded = True
-                raise SkillRepositoryError("Skill usage state could not be saved") from exc
+            self._pending_evaluations.update(refs)
+
+    async def release_evaluation(self, refs: tuple[SkillRef, ...]) -> None:
+        async with self._lock:
+            self._pending_evaluations.difference_update(refs)
 
     async def record_discard(self, reason: str) -> None:
         async with self._lock:
@@ -161,7 +249,6 @@ class SkillRepository:
             try:
                 current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
                 usage = await asyncio.to_thread(self.store.load_usage)
-                now = datetime.now(UTC)
                 pruned: list[SkillRef] = []
                 for definition in tuple(current.by_identity.values()):
                     if definition.source.value != "generated":
@@ -169,33 +256,21 @@ class SkillRepository:
                     entry = usage.get(f"{definition.scope.value}:{definition.name}")
                     if entry is None or entry.version != definition.version:
                         continue
-                    old = (now - definition.updated_at).days >= config.evolution.prune_unused_days
-                    last_used = (
-                        datetime.strptime(entry.last_used_at, "%Y-%m-%dT%H:%M:%SZ").replace(
-                            tzinfo=UTC
-                        )
-                        if entry.last_used_at
-                        else None
+                    window = entry.adjudicated_retrievals
+                    if len(window) < 5 or definition.ref in self._pending_evaluations:
+                        continue
+                    baseline = entry.version_last_applied_at or definition.updated_at.astimezone(
+                        UTC
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    oldest = datetime.strptime(
+                        window[0].retrieved_at, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=UTC)
+                    baseline_time = datetime.strptime(baseline, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=UTC
                     )
-                    unused = (
-                        last_used is None
-                        or (now - last_used).days >= config.evolution.prune_unused_days
-                    )
-                    dormant = (
-                        old
-                        and unused
-                        and (
-                            entry.version_used > 0
-                            or entry.version_retrieve >= config.evolution.prune_min_retrieve
-                        )
-                    )
-                    ineffective = (
-                        entry.version_retrieve >= config.evolution.prune_min_retrieve
-                        and entry.version_relevant >= config.evolution.prune_min_relevant
-                        and entry.version_relevant / max(entry.version_used, 1)
-                        > config.evolution.prune_relevant_used_ratio
-                    )
-                    if not (dormant or ineffective):
+                    if oldest < baseline_time + timedelta(
+                        days=config.evolution.prune_unapplied_days
+                    ):
                         continue
                     preimage = await asyncio.to_thread(
                         lambda path=definition.skill_dir / "SKILL.md": hashlib.sha256(

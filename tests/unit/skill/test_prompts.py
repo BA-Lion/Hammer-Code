@@ -12,7 +12,7 @@ def test_extractor_prompt_supplies_its_strict_json_schema() -> None:
     assert "Required output JSON Schema:" in prompt
     assert '"candidate_action"' in prompt
     assert '"additionalProperties": false' in prompt
-    assert '"evaluations"' in prompt
+    assert '"evaluations"' not in prompt
 
 
 def test_maintenance_prompt_supplies_its_strict_json_schema() -> None:

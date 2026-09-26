@@ -16,13 +16,14 @@ from hammer_code.app.token_estimator import TokenEstimator
 from hammer_code.config import SkillConfig
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import ModelRequest, ResponseCompleted, StopReason, UsageUpdated
-from hammer_code.domain.messages import Message, ReasoningBlock, RefusalBlock, TextBlock
+from hammer_code.domain.messages import Message, ReasoningBlock, TextBlock
 from hammer_code.llm.client import ModelClient
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
 from hammer_code.skill.catalog import SkillCatalog
 from hammer_code.skill.models import (
     CatalogSnapshot,
+    EvaluatorResponse,
     EvolutionQueueItem,
     ExtractedCandidate,
     ExtractorResponse,
@@ -33,9 +34,11 @@ from hammer_code.skill.models import (
     SkillRef,
     SkillScope,
     SkillSource,
+    SkillTurnEvidence,
 )
 from hammer_code.skill.prompts import (
     build_correction_prompt,
+    build_evaluator_prompt,
     build_extractor_prompt,
     build_maintenance_prompt,
 )
@@ -103,6 +106,15 @@ class SkillEvolutionService:
         self._queue.append(EvolutionQueueItem(tuple(messages), current_input, previous))
         self._start_worker()
 
+    def schedule_evidence(self, evidence: SkillTurnEvidence, current_input: str) -> None:
+        """Queue the immutable completed-turn snapshot without blocking the main turn."""
+        if not self._accepting or not _can_write(self.config, self.permissions):
+            return
+        self._queue.append(
+            EvolutionQueueItem(evidence.live_messages, current_input, None, evidence=evidence)
+        )
+        self._start_worker()
+
     async def feedback(self, name: str, feedback: str) -> None:
         if not feedback.strip():
             raise SkillEvolutionError("Skill feedback must not be empty")
@@ -168,43 +180,6 @@ class SkillEvolutionService:
             # A presentation failure must not terminate the queue or affect the main conversation.
             pass
 
-    def _visible(self, messages: tuple[Message, ...]) -> tuple[Message, ...]:
-        visible: list[Message] = []
-        for message in reversed(messages):
-            blocks = tuple(
-                block for block in message.content if isinstance(block, (TextBlock, RefusalBlock))
-            )
-            if blocks:
-                visible.append(Message(message.role, blocks))
-            if len(visible) >= self.config.evolution.max_history_messages:
-                break
-        visible.reverse()
-        while (
-            visible
-            and self._estimator.estimate_messages(tuple(visible))
-            > self.config.evolution.max_input_tokens
-        ):
-            visible.pop(0)
-        return tuple(visible)
-
-    def _truncate_current_input(self, value: str) -> str:
-        """Keep the independent current-input tag inside its configured budget."""
-        if self._estimator.estimate_text(value) <= self.config.evolution.max_input_tokens:
-            return value
-        encoded = value.encode("utf-8")
-        low, high = 0, len(encoded)
-        while low < high:
-            midpoint = (low + high + 1) // 2
-            trial = encoded[:midpoint].decode("utf-8", errors="ignore")
-            if (
-                self._estimator.estimate_text(trial + "\n[truncated]")
-                <= self.config.evolution.max_input_tokens
-            ):
-                low = midpoint
-            else:
-                high = midpoint - 1
-        return encoded[:low].decode("utf-8", errors="ignore") + "\n[truncated]"
-
     async def _request_text(self, prompt: str, messages: tuple[Message, ...]) -> str:
         request_id = str(uuid4())
         request = ModelRequest(
@@ -250,10 +225,10 @@ class SkillEvolutionService:
     async def _validated(
         self,
         stage: str,
-        model: type[ExtractorResponse] | type[MaintenanceOperation],
+        model: type[ExtractorResponse] | type[MaintenanceOperation] | type[EvaluatorResponse],
         prompt: str,
         messages: tuple[Message, ...],
-    ) -> ExtractorResponse | MaintenanceOperation:
+    ) -> ExtractorResponse | MaintenanceOperation | EvaluatorResponse:
         response = await self._request_text(prompt, messages)
         for attempt in range(self.config.evolution.max_corrections + 1):
             try:
@@ -275,15 +250,7 @@ class SkillEvolutionService:
             else {item.ref for item in previous.retrieved}
         )
 
-    def _validate_extractor(
-        self, response: ExtractorResponse, previous: SkillObservation | None
-    ) -> tuple[tuple[SkillRef, str], ...]:
-        expected = self._expected_evaluations(previous)
-        received = [SkillRef(item.scope, item.name, item.version) for item in response.evaluations]
-        if len(received) != len(set(received)) or set(received) != expected:
-            raise SkillEvolutionError(
-                "Extractor evaluations do not exactly match previous retrieval"
-            )
+    def _validate_extractor(self, response: ExtractorResponse) -> None:
         if response.candidate and response.candidate.allowed_tools is not None:
             if set(response.candidate.allowed_tools).difference(self.available_tool_names):
                 raise SkillEvolutionError("Extractor candidate contains unknown allowed tools")
@@ -292,11 +259,27 @@ class SkillEvolutionService:
             and len(response.candidate.body) > self.config.evolution.max_body_chars
         ):
             raise SkillEvolutionError("Extractor candidate body exceeds configured maximum")
-        return tuple(
-            (SkillRef(item.scope, item.name, item.version), item.reason)
-            for item in response.evaluations
-            if item.relevant
-        )
+        return None
+
+    @staticmethod
+    def _validate_evaluator(response: EvaluatorResponse, evidence: SkillTurnEvidence) -> None:
+        expected_retrieved = {item.ref for item in evidence.retrieved}
+        expected_loaded = {item.ref for item in evidence.loaded}
+        relevance = [
+            SkillRef(item.scope, item.name, item.version) for item in response.relevance_evaluations
+        ]
+        application = [
+            SkillRef(item.scope, item.name, item.version)
+            for item in response.application_evaluations
+        ]
+        if len(relevance) != len(set(relevance)) or set(relevance) != expected_retrieved:
+            raise SkillEvolutionError(
+                "Evaluator relevance identities do not exactly match retrieval"
+            )
+        if len(application) != len(set(application)) or set(application) != expected_loaded:
+            raise SkillEvolutionError(
+                "Evaluator application identities do not exactly match loaded Skills"
+            )
 
     def _candidate_definitions(
         self,
@@ -372,28 +355,6 @@ class SkillEvolutionService:
             candidate.allowed_tools,
         )
 
-    def _automatic_update_target_ref(
-        self, snapshot: CatalogSnapshot, candidate: ExtractedCandidate
-    ) -> SkillRef | None:
-        if snapshot.index is None:
-            return None
-        matches = snapshot.index.normalized_merge_candidates(
-            self._candidate_query(candidate),
-            self._proposed_definition(candidate),
-            snapshot.by_identity.values(),
-            2,
-        )
-        first = next(iter(matches), None)
-        if first is None or first.relative_score < self.config.evolution.forced_merge_score:
-            return None
-        if (
-            len(matches) > 1
-            and first.relative_score - matches[1].relative_score
-            < self.config.evolution.forced_merge_margin
-        ):
-            return None
-        return first.ref
-
     def _validate_operation(
         self,
         operation: MaintenanceOperation,
@@ -437,22 +398,54 @@ class SkillEvolutionService:
             stage = "catalog snapshot"
             snapshot = await self.repository.snapshot_for_turn()
             previous = item.previous_observation
+            evidence = item.evidence
+            if evidence is not None:
+                stage = "Evaluator"
+                await self.repository.reserve_evaluation(
+                    tuple(item.ref for item in evidence.retrieved)
+                )
+                try:
+                    evaluator = await self._validated(
+                        "Evaluator",
+                        EvaluatorResponse,
+                        build_evaluator_prompt(
+                            evidence.retrieved, evidence.loaded, evidence.retrieved_prompt
+                        ),
+                        evidence.live_messages,
+                    )
+                    assert isinstance(evaluator, EvaluatorResponse)
+                    self._validate_evaluator(evaluator, evidence)
+                    await self.repository.record_evaluation(
+                        evaluator.relevance_evaluations,
+                        evaluator.application_evaluations,
+                        retrieve_event_ids=evidence.retrieve_event_ids,
+                        loaded_event_ids=tuple(item.event_id for item in evidence.loaded),
+                    )
+                    await self.repository.prune_eligible(self.config)
+                except Exception:
+                    await self.repository.record_evaluation((), (), failure_stage="evaluator")
+                    self._warn_failure("Evaluator")
+                finally:
+                    await self.repository.release_evaluation(
+                        tuple(item.ref for item in evidence.retrieved)
+                    )
             stage = "Extractor"
             extractor = await self._validated(
                 "Extractor",
                 ExtractorResponse,
                 build_extractor_prompt(
-                    self._truncate_current_input(item.current_input),
-                    previous.retrieved if previous and previous.completed else (),
+                    item.current_input,
+                    evidence.retrieved
+                    if evidence is not None
+                    else previous.retrieved
+                    if previous and previous.completed
+                    else (),
                     item.feedback,
                 ),
-                self._visible(item.messages),
+                item.messages,
             )
             assert isinstance(extractor, ExtractorResponse)
-            evaluations = self._validate_extractor(extractor, previous)
-            if evaluations:
-                stage = "evaluation persistence"
-                await self.repository.record_evaluations(evaluations)
+            self._validate_extractor(extractor)
             if extractor.candidate is None:
                 stage = "commit"
                 await self.repository.record_discard(
@@ -460,9 +453,7 @@ class SkillEvolutionService:
                 )
                 return
             stage = "Maintenance"
-            update_target_ref = item.update_target_ref or self._automatic_update_target_ref(
-                snapshot, extractor.candidate
-            )
+            update_target_ref = item.update_target_ref
             candidates = self._candidate_definitions(
                 snapshot, extractor.candidate, update_target_ref
             )

@@ -5,6 +5,8 @@ from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock, ToolResultBlock
 from hammer_code.domain.usage import TokenUsage
 from hammer_code.errors import ConversationBusyError, InvalidTurnStateError
+from hammer_code.skill.history import project_durable_skill_messages
+from hammer_code.skill.models import SkillLoadOutcome, SkillRef, SkillScope
 
 
 def _resolved():
@@ -86,3 +88,29 @@ def test_interrupted_turn_keeps_complete_tool_exchange() -> None:
         Role.ASSISTANT,
         Role.USER,
     ]
+
+
+def test_durable_skill_projection_keeps_live_body_and_replaces_only_known_result() -> None:
+    manager = ConversationManager()
+    manager.create(_resolved())
+    turn = manager.begin_turn("help")
+    call = ToolCallBlock("skill-call", "use_skill", {"name": "review"}, '{"name":"review"}')
+    manager.stage_tool_call(turn, Message(Role.ASSISTANT, (call,)))
+    result = ToolResultBlock("skill-call", (TextBlock("private Skill body"),), False)
+    manager.stage_tool_results(turn, Message(Role.USER, (result,)))
+    outcome = manager.commit(
+        turn,
+        Message(Role.ASSISTANT, (TextBlock("done"),)),
+        lambda live: project_durable_skill_messages(
+            live,
+            {"skill-call": SkillLoadOutcome(SkillRef(SkillScope.PROJECT, "review", "1.0.0"))},
+        ),
+    )
+    live_result = outcome.live_messages[2].content[0]
+    durable_result = outcome.durable_messages[2].content[0]
+    assert isinstance(live_result, ToolResultBlock)
+    assert isinstance(durable_result, ToolResultBlock)
+    assert isinstance(live_result.content[0], TextBlock)
+    assert isinstance(durable_result.content[0], TextBlock)
+    assert live_result.content[0].text == "private Skill body"
+    assert "private Skill body" not in durable_result.content[0].text

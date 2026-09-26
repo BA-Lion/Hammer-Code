@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 from hammer_code.config import ContextConfig, SkillConfig
@@ -11,8 +11,14 @@ from hammer_code.domain.events import ModelRequest, ResponseCompleted, StopReaso
 from hammer_code.domain.messages import Message, Role, TextBlock, ToolCallBlock
 from hammer_code.domain.usage import TokenUsage
 from hammer_code.llm.client import ModelClient
-from hammer_code.skill.catalog import SkillCatalog
-from hammer_code.skill.models import CatalogSnapshot, SkillDefinition, SkillObservation
+from hammer_code.skill.models import (
+    CatalogSnapshot,
+    LoadedSkill,
+    SkillDefinition,
+    SkillLoadOutcome,
+    SkillObservation,
+    SkillTurnEvidence,
+)
 from hammer_code.skill.parser import SkillInvocationError, render_skill
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.tools.base import ToolExecutionResult
@@ -28,6 +34,18 @@ class PreparedUserInvocation:
     definition: SkillDefinition
 
 
+@dataclass
+class SkillTurnState:
+    snapshot: CatalogSnapshot
+    retrieved: tuple = ()
+    retrieved_prompt: str = ""
+    retrieve_event_ids: tuple[str, ...] = ()
+    loaded_by_effective_name: dict[str, LoadedSkill] = field(default_factory=dict)
+    loaded_by_alias: dict[str, LoadedSkill] = field(default_factory=dict)
+    tool_outcomes: dict[str, SkillLoadOutcome] = field(default_factory=dict)
+    pending_outcomes: list[SkillLoadOutcome] = field(default_factory=list)
+
+
 class SkillInvocationService:
     """Holds a single pinned catalog snapshot for one active Agent turn."""
 
@@ -41,6 +59,7 @@ class SkillInvocationService:
         self.skill_config = skill_config
         self.context_config = context_config
         self._snapshot: CatalogSnapshot | None = None
+        self._state: SkillTurnState | None = None
         self._observation: SkillObservation | None = None
         self._fork_runtime: _ForkRuntime | None = None
 
@@ -67,30 +86,67 @@ class SkillInvocationService:
             record_usage,
         )
 
-    def begin_turn(self, snapshot: CatalogSnapshot, observation: SkillObservation | None) -> None:
+    def begin_turn(
+        self,
+        snapshot: CatalogSnapshot,
+        observation: SkillObservation | None,
+        *,
+        retrieved_prompt: str = "",
+        retrieve_event_ids: tuple[str, ...] = (),
+    ) -> None:
         self._snapshot = snapshot
         self._observation = observation
+        self._state = SkillTurnState(
+            snapshot,
+            observation.retrieved if observation else (),
+            retrieved_prompt,
+            retrieve_event_ids,
+        )
 
     def end_turn(self, *, completed: bool) -> SkillObservation | None:
         observation = self._observation
         self._snapshot = None
         self._observation = None
+        self._state = None
         if observation is None:
             return None
         return SkillObservation(
             observation.snapshot_generation, observation.retrieved, observation.used, completed
         )
 
-    def _resolve(self, name: str, *, user: bool, model: bool):
+    async def _resolve(self, name: str, *, user: bool, model: bool) -> SkillDefinition:
         if not self.skill_config.enabled:
             raise SkillInvocationError("Skills are disabled by configuration")
         if self._snapshot is None:
             raise SkillInvocationError("Skill invocation is unavailable outside an active turn")
-        return SkillCatalog.resolve(self._snapshot, name, user=user, model=model)
+        state = self._state
+        if state is not None and name in state.loaded_by_alias:
+            return state.loaded_by_alias[name].ref and await self.repository.resolve_latest(
+                name, user=user, model=model
+            )
+        return await self.repository.resolve_latest(name, user=user, model=model)
 
     async def invoke(self, name: str, arguments: str) -> ToolExecutionResult:
         try:
-            definition = self._resolve(name, user=False, model=True)
+            state = self._state
+            if state is not None and name in state.loaded_by_alias:
+                loaded = state.loaded_by_alias[name]
+                state.pending_outcomes.append(SkillLoadOutcome(loaded.ref))
+                receipt = (
+                    f"Skill already loaded for this turn: {loaded.ref.scope.value}:"
+                    f"{loaded.ref.name}@{loaded.ref.version}."
+                )
+                return ToolExecutionResult(receipt)
+            definition = await self._resolve(name, user=False, model=True)
+            if state is not None and definition.name in state.loaded_by_effective_name:
+                loaded = state.loaded_by_effective_name[definition.name]
+                state.loaded_by_alias[name] = loaded
+                state.pending_outcomes.append(SkillLoadOutcome(loaded.ref))
+                receipt = (
+                    f"Skill already loaded for this turn: {loaded.ref.scope.value}:"
+                    f"{loaded.ref.name}@{loaded.ref.version}."
+                )
+                return ToolExecutionResult(receipt)
             rendered = render_skill(definition, arguments)
             if definition.context.value == "inline" and not fits_inline_result(
                 rendered, self.context_config
@@ -102,7 +158,21 @@ class SkillInvocationService:
                 )
             if definition.context.value == "fork" and self._fork_runtime is None:
                 return ToolExecutionResult("Error: fork Skill runtime is unavailable.", True)
-            await self.repository.record_used(definition.ref)
+            event_id = await self.repository.record_loaded(
+                definition.ref,
+                invocation_kind="fork" if definition.context.value == "fork" else "model",
+                catalog_generation=self._snapshot.generation if self._snapshot else 0,
+            )
+            if state is not None:
+                loaded = LoadedSkill(
+                    definition.ref,
+                    rendered,
+                    "fork" if definition.context.value == "fork" else "model",
+                    event_id,
+                )
+                state.loaded_by_effective_name[definition.name] = loaded
+                state.loaded_by_alias[name] = loaded
+                state.pending_outcomes.append(SkillLoadOutcome(definition.ref))
             if self._observation is not None:
                 self._observation = SkillObservation(
                     self._observation.snapshot_generation,
@@ -116,14 +186,58 @@ class SkillInvocationService:
             return ToolExecutionResult(f"Error: {exc}", True)
 
     async def invoke_user(self, name: str, arguments: str) -> PreparedUserInvocation:
-        definition = self._resolve(name, user=True, model=False)
+        state = self._state
+        if state is not None and name in state.loaded_by_alias:
+            loaded = state.loaded_by_alias[name]
+            return PreparedUserInvocation(
+                loaded.body,
+                False,
+                await self.repository.resolve_latest(name, user=True, model=False),
+            )
+        definition = await self._resolve(name, user=True, model=False)
         rendered = render_skill(definition, arguments)
         if len(rendered) > self.skill_config.evolution.max_body_chars:
             raise SkillInvocationError("Skill body exceeds the configured maximum")
         if definition.context.value == "fork" and self._fork_runtime is None:
             raise SkillInvocationError("fork Skill runtime is unavailable")
-        await self.repository.record_used(definition.ref)
+        event_id = await self.repository.record_loaded(
+            definition.ref,
+            invocation_kind="direct",
+            catalog_generation=self._snapshot.generation if self._snapshot else 0,
+        )
+        if state is not None:
+            loaded = LoadedSkill(definition.ref, rendered, "direct", event_id)
+            state.loaded_by_effective_name[definition.name] = loaded
+            state.loaded_by_alias[name] = loaded
         return PreparedUserInvocation(rendered, definition.context.value == "fork", definition)
+
+    def observe_tool_result(self, call: ToolCallBlock, arguments: object, raw: object) -> None:
+        """Associate successful use_skill results by the executor's real call id."""
+        if call.name != "use_skill" or self._state is None:
+            return
+        if self._state.pending_outcomes:
+            self._state.tool_outcomes[call.call_id] = self._state.pending_outcomes.pop(0)
+
+    def finish_turn_evidence(
+        self, *, completed: bool, live_messages: tuple[Message, ...]
+    ) -> SkillTurnEvidence | None:
+        state = self._state
+        if state is None:
+            return None
+        evidence = SkillTurnEvidence(
+            tuple(state.retrieved),
+            state.retrieved_prompt,
+            tuple(state.loaded_by_effective_name.values()),
+            live_messages,
+            completed,
+            state.retrieve_event_ids,
+        )
+        self.end_turn(completed=completed)
+        return evidence
+
+    @property
+    def tool_outcomes(self) -> dict[str, SkillLoadOutcome]:
+        return {} if self._state is None else dict(self._state.tool_outcomes)
 
     async def invoke_prepared_fork(
         self, prepared: PreparedUserInvocation, arguments: str

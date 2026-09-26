@@ -19,21 +19,19 @@ _B = 0.75
 
 
 def tokenize(value: str) -> tuple[str, ...]:
-    """Split identifiers while preserving CJK uni- and bi-gram recall."""
+    """Split identifiers, using CJK unigrams only for a one-character run."""
     normalized = unicodedata.normalize("NFKC", value)
     tokens: list[str] = []
     for piece in _ASCII_SPLIT.split(normalized):
         if not piece:
             continue
-        cjk_runs = _CJK.findall(piece)
         non_cjk = _CJK.sub(" ", piece).casefold()
         tokens.extend(item for item in non_cjk.split() if item)
-        for run in cjk_runs:
-            tokens.append(run)
-        # Consecutive CJK characters must also produce bigrams. Re-scan the
-        # normalized source so runs are not broken by ASCII identifiers.
     for run in re.findall(r"[\u3400-\u9fff\uf900-\ufaff]+", normalized):
-        tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+        if len(run) == 1:
+            tokens.append(run)
+        else:
+            tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
     return tuple(tokens)
 
 
@@ -93,18 +91,20 @@ class Bm25Index:
             self._document(definition),
         )
         query_tokens = tuple(dict.fromkeys(tokenize(query)))
-        total_idf = sum(self._idf(token) for token in query_tokens)
-        if not total_idf:
+        if not query_tokens:
             return 0.0, 0.0
         score = 0.0
-        matched_idf = 0.0
+        matched_tokens = 0
         for token in query_tokens:
             field_tf = self._field_tf(token, document)
             if field_tf:
                 idf = self._idf(token)
-                matched_idf += idf
+                matched_tokens += 1
                 score += idf * (_K1 + 1) * field_tf / (_K1 + field_tf)
-        return score, matched_idf / total_idf
+        # OOV tokens deliberately remain in this denominator.  They supply no
+        # BM25 score but prevent a tiny common-token overlap from looking like
+        # comprehensive metadata evidence.
+        return score, matched_tokens / len(query_tokens)
 
     def retrieve(
         self,

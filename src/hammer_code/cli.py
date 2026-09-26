@@ -17,6 +17,7 @@ from hammer_code.config import EndpointTrustPolicy, discover_config, load_config
 from hammer_code.errors import HammerCodeError
 from hammer_code.hooks.config import load_hook_definitions
 from hammer_code.llm.factory import create_model_client
+from hammer_code.local_state_migration import LocalStateMigrationError, migrate_local_state
 from hammer_code.mcp.manager import McpManager
 from hammer_code.memory.store import MemoryStore
 from hammer_code.permissions.checker import PermissionChecker
@@ -76,6 +77,10 @@ async def _run(args: argparse.Namespace) -> int:
         config = load_config(path)
         hook_definitions = load_hook_definitions(path.parent / "hooks.toml")
         workspace_root = path.parent.parent.resolve()
+        try:
+            await asyncio.to_thread(migrate_local_state, workspace_root)
+        except LocalStateMigrationError as exc:
+            raise HammerCodeError(str(exc)) from exc
         sessions = SessionManager(workspace_root)
         await asyncio.to_thread(sessions.cleanup)
         if getattr(args, "list_sessions", False):

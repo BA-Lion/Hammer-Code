@@ -144,7 +144,7 @@ class ToolExecutor:
     def _paths_for(self, name: str, arguments: BaseModel) -> tuple:
         if name in {"read_file", "edit_file", "create_file", "grep", "glob"}:
             path = str(arguments.model_dump()["path"])
-            return (PathPolicy(self.context.workspace_root).canonicalize(path),)
+            return (PathPolicy(self.context.workspace_root).guarded(path, name),)
         return ()
 
     async def _run(self, call: ToolCallBlock, arguments: BaseModel) -> ToolResultBlock:

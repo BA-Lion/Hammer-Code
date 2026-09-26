@@ -133,7 +133,7 @@ def test_metadata_retrieval_handles_identifier_and_cjk_tokens(tmp_path: Path) ->
 
     assert english[0].ref.name == "commit-review"
     assert chinese[0].ref.name == "translate-doc"
-    assert {"翻", "译", "翻译"}.issubset(tokenize("翻译"))
+    assert set(tokenize("翻译")) == {"翻译"}
     assert isinstance(Bm25Index(snapshot.effective.values()), Bm25Index)
 
 
