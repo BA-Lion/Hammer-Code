@@ -37,11 +37,15 @@ from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
 from hammer_code.skill.evolution import SkillEvolutionError, SkillEvolutionService
 from hammer_code.skill.models import (
+    LoadedSkill,
     MaintenanceOperation,
+    RetrievedSkill,
     SkillDefinition,
     SkillScope,
     SkillSource,
+    SkillTurnEvidence,
 )
+from hammer_code.skill.prompts import build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.skill.store import PreparedSkillWrite
 
@@ -76,6 +80,138 @@ class _Client:
 
 def _config() -> SkillConfig:
     return SkillConfig(evolution=SkillEvolutionConfig(enabled=True))
+
+
+@pytest.mark.asyncio
+async def test_evaluator_and_extractor_reuse_frozen_live_input_and_actual_metadata(
+    tmp_path: Path,
+) -> None:
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    definition = SkillDefinition(
+        "review",
+        "Specific retrieved description",
+        "0.1.0",
+        now,
+        now,
+        SkillSource.MANUAL,
+        "Frozen direct instructions.",
+        SkillScope.PROJECT,
+        tmp_path / ".hammer-code" / "skill" / "project" / "review",
+        when_to_use="Specific retrieved trigger",
+        arguments_required=True,
+        argument_hint="A diff",
+        allowed_tools=(),
+    )
+    await repository.commit(PreparedSkillWrite("add", definition, None, "test", "evidence-add"))
+    snapshot = await repository.snapshot_for_turn()
+    retrieved = (RetrievedSkill(definition.ref, 1.0, 1.0, 1.0),)
+    metadata = build_skill_request_prompt(snapshot, retrieved)
+    ids = await repository.record_retrieved((definition.ref,))
+    loaded_id = await repository.record_loaded(definition.ref, invocation_kind="direct")
+    live = (
+        Message(
+            Role.USER,
+            (TextBlock("Original problem\n\nFrozen direct instructions.\n\n" + metadata),),
+        ),
+    )
+    evidence = SkillTurnEvidence(
+        retrieved,
+        metadata,
+        (
+            LoadedSkill(
+                definition.ref, "This body must not be appended again.", "direct", loaded_id
+            ),
+        ),
+        live,
+        True,
+        ids,
+    )
+    (definition.skill_dir / "SKILL.md").write_text(
+        (definition.skill_dir / "SKILL.md")
+        .read_text(encoding="utf-8")
+        .replace("Frozen direct instructions.", "Changed body after the turn."),
+        encoding="utf-8",
+    )
+    response = json.dumps(
+        {
+            "relevance_evaluations": [
+                {
+                    "scope": "project",
+                    "name": "review",
+                    "version": "0.1.0",
+                    "relevant": True,
+                    "reason": "relevant",
+                }
+            ],
+            "application_evaluations": [
+                {
+                    "scope": "project",
+                    "name": "review",
+                    "version": "0.1.0",
+                    "applied": True,
+                    "reason": "applied",
+                }
+            ],
+        }
+    )
+    client = _Client([response, _discard()])
+    warnings: list[str] = []
+    service = SkillEvolutionService(
+        cast(ModelClient, client),
+        repository,
+        cast(PermissionService, SimpleNamespace(mode=PermissionMode.UNATTENDED)),
+        cast(ConversationManager, SimpleNamespace()),
+        _config(),
+        100,
+        warning=warnings.append,
+    )
+    service.schedule_evidence(evidence, "Original problem")
+    await service.wait_idle()
+    assert warnings == [] and len(client.requests) == 2
+    for request in client.requests:
+        assert request.messages == live
+        assert metadata in request.system_prompt
+        assert "Specific retrieved trigger" in request.system_prompt
+        assert "arguments-required: true" in request.system_prompt
+        assert "allowed-tools: []" in request.system_prompt
+        assert "Frozen direct instructions." not in request.system_prompt
+        assert "must not be appended again" not in str(request)
+        assert "Changed body after the turn" not in str(request)
+
+
+@pytest.mark.asyncio
+async def test_evaluator_record_failure_does_not_suppress_extractor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+
+    async def fail_record(*args, **kwargs):
+        raise ValueError("auxiliary write unavailable")
+
+    monkeypatch.setattr(repository, "record_evaluation", fail_record)
+    live = (Message(Role.USER, (TextBlock("frozen input"),)),)
+    evidence = SkillTurnEvidence((), "", (), live, True)
+    client = _Client(['{"relevance_evaluations":[],"application_evaluations":[]}', _discard()])
+    warnings: list[str] = []
+    service = SkillEvolutionService(
+        cast(ModelClient, client),
+        repository,
+        cast(PermissionService, SimpleNamespace(mode=PermissionMode.UNATTENDED)),
+        cast(ConversationManager, SimpleNamespace()),
+        _config(),
+        100,
+        warning=warnings.append,
+    )
+    service.schedule_evidence(evidence, "frozen input")
+    await service.wait_idle()
+    assert len(client.requests) == 2
+    assert client.requests[1].messages == live
+    assert "Skill Extractor" in client.requests[1].system_prompt
+    assert len(warnings) == 1 and "Evaluator" in warnings[0]
 
 
 def _candidate(name: str = "release-check") -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,7 +39,6 @@ class SkillRepository:
         self._lock = asyncio.Lock()
         self._state_degraded = False
         self._catalog_unavailable = False
-        self._pending_evaluations: set[SkillRef] = set()
 
     @property
     def state_degraded(self) -> bool:
@@ -50,11 +50,9 @@ class SkillRepository:
             self._current = await asyncio.to_thread(self.catalog.build_snapshot, None)
             self._catalog_unavailable = False
             try:
-                await asyncio.to_thread(
-                    self.store.rebuild_usage, self._current.by_identity.values()
-                )
+                await asyncio.to_thread(self.store.sync_usage, self._current.by_identity.values())
                 self._state_degraded = False
-            except SkillStoreError:
+            except (OSError, SkillStoreError):
                 self._state_degraded = True
             return self._current, report
 
@@ -71,6 +69,12 @@ class SkillRepository:
     def _assert_writable_state(self) -> None:
         if self._state_degraded:
             raise SkillRepositoryError("Skill state is unavailable; Skill usage is disabled")
+
+    async def _sync_current_usage(self) -> None:
+        # A failed auxiliary commit or an external atomic publication may have
+        # advanced the current file since the last catalog request.
+        self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
+        await asyncio.to_thread(self.store.sync_usage, self._current.by_identity.values())
 
     async def _validate_refs(self, refs: tuple[SkillRef, ...]) -> None:
         try:
@@ -104,6 +108,7 @@ class SkillRepository:
         async with self._lock:
             self._assert_writable_state()
             try:
+                await self._sync_current_usage()
                 event_ids = await asyncio.to_thread(
                     self.store.record_retrieved,
                     refs,
@@ -111,11 +116,8 @@ class SkillRepository:
                     turn_id=turn_id,
                     catalog_generation=catalog_generation,
                 )
-                await asyncio.to_thread(
-                    self.store.rebuild_usage, self._current.by_identity.values()
-                )
                 return event_ids
-            except SkillStoreError as exc:
+            except (OSError, SkillStoreError, SkillCatalogError) as exc:
                 self._state_degraded = True
                 raise SkillRepositoryError("Skill usage state could not be saved") from exc
 
@@ -131,6 +133,7 @@ class SkillRepository:
         async with self._lock:
             self._assert_writable_state()
             try:
+                await self._sync_current_usage()
                 event_id = await asyncio.to_thread(
                     self.store.record_loaded,
                     ref,
@@ -139,11 +142,8 @@ class SkillRepository:
                     turn_id=turn_id,
                     catalog_generation=catalog_generation,
                 )
-                await asyncio.to_thread(
-                    self.store.rebuild_usage, self._current.by_identity.values()
-                )
                 return event_id
-            except SkillStoreError as exc:
+            except (OSError, SkillStoreError, SkillCatalogError) as exc:
                 self._state_degraded = True
                 raise SkillRepositoryError("Skill usage state could not be saved") from exc
 
@@ -161,6 +161,7 @@ class SkillRepository:
         async with self._lock:
             self._assert_writable_state()
             try:
+                await self._sync_current_usage()
                 event_id = await asyncio.to_thread(
                     self.store.record_evaluation,
                     relevance,
@@ -171,25 +172,14 @@ class SkillRepository:
                     turn_id=turn_id,
                     failure_stage=failure_stage,
                 )
-                await asyncio.to_thread(
-                    self.store.rebuild_usage, self._current.by_identity.values()
-                )
                 return event_id
-            except SkillStoreError as exc:
+            except (OSError, SkillStoreError, SkillCatalogError) as exc:
                 self._state_degraded = True
                 raise SkillRepositoryError("Skill usage state could not be saved") from exc
 
     async def record_used(self, ref: SkillRef) -> None:
         """Compatibility shim for callers predating the unambiguous loaded signal."""
         await self.record_loaded(ref, invocation_kind="legacy")
-
-    async def reserve_evaluation(self, refs: tuple[SkillRef, ...]) -> None:
-        async with self._lock:
-            self._pending_evaluations.update(refs)
-
-    async def release_evaluation(self, refs: tuple[SkillRef, ...]) -> None:
-        async with self._lock:
-            self._pending_evaluations.difference_update(refs)
 
     async def record_discard(self, reason: str) -> None:
         async with self._lock:
@@ -242,10 +232,14 @@ class SkillRepository:
             except (SkillStoreError, SkillCatalogError) as exc:
                 raise SkillRepositoryError("Pruned Skill could not be restored") from exc
 
-    async def prune_eligible(self, config: SkillConfig) -> tuple[SkillRef, ...]:
+    async def prune_eligible(
+        self, config: SkillConfig, *, can_write: Callable[[], bool]
+    ) -> tuple[SkillRef, ...]:
         """Prune only current generated entries satisfying a configured safe threshold."""
         async with self._lock:
             self._assert_writable_state()
+            if not config.enabled or not config.evolution.enabled or not can_write():
+                return ()
             try:
                 current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
                 usage = await asyncio.to_thread(self.store.load_usage)
@@ -257,7 +251,7 @@ class SkillRepository:
                     if entry is None or entry.version != definition.version:
                         continue
                     window = entry.adjudicated_retrievals
-                    if len(window) < 5 or definition.ref in self._pending_evaluations:
+                    if len(window) < 5:
                         continue
                     baseline = entry.version_last_applied_at or definition.updated_at.astimezone(
                         UTC
@@ -277,7 +271,20 @@ class SkillRepository:
                             path.read_bytes()
                         ).hexdigest()
                     )
-                    await asyncio.to_thread(self.store.commit_prune, definition, preimage)
+
+                    def guard(
+                        key=f"{definition.scope.value}:{definition.name}", expected=entry
+                    ) -> bool:
+                        return (
+                            config.enabled
+                            and config.evolution.enabled
+                            and can_write()
+                            and self.store.load_usage().get(key) == expected
+                        )
+
+                    await asyncio.to_thread(
+                        self.store.commit_prune, definition, preimage, guard=guard
+                    )
                     pruned.append(definition.ref)
                 if pruned:
                     self._current = await asyncio.to_thread(self.catalog.build_snapshot, current)

@@ -310,6 +310,7 @@ class PrimaryAgent:
         unknown_count = 0
         skill_prompt = ""
         skill_started = False
+        direct_skill_prompt = ""
         turn_error = ""
         try:
             await self._flush_subagent_results_locked()
@@ -333,12 +334,18 @@ class PrimaryAgent:
                             else ()
                         )
                         if retrieved:
-                            retrieval_event_ids = (
-                                await self.skill_service.repository.record_retrieved(
-                                    tuple(item.ref for item in retrieved),
-                                    catalog_generation=skill_snapshot.generation,
+                            try:
+                                retrieval_event_ids = (
+                                    await self.skill_service.repository.record_retrieved(
+                                        tuple(item.ref for item in retrieved),
+                                        catalog_generation=skill_snapshot.generation,
+                                    )
                                 )
-                            )
+                            except SkillRepositoryError:
+                                self.ui.skill_warning(
+                                    "Skill usage state is unavailable; "
+                                    "current Skills remain callable."
+                                )
                         skill_prompt = build_skill_request_prompt(skill_snapshot, retrieved)
                     else:
                         retrieved = ()
@@ -370,10 +377,15 @@ class PrimaryAgent:
                                     ),
                                 )
                             return
-                        skill_prompt = prepared.prompt
+                        direct_skill_prompt = prepared.prompt
                 except SkillRepositoryError:
                     self.ui.error("Skill catalog is unavailable for this turn.")
             turn = self.manager.begin_turn(text)
+            if direct_skill_prompt:
+                self.manager.append_live_user_context(
+                    turn, "\n\n".join(part for part in (direct_skill_prompt, skill_prompt) if part)
+                )
+                skill_prompt = ""
             while request_count < 50:
                 request_count += 1
                 request_id = str(uuid4())
@@ -701,7 +713,9 @@ class PrimaryAgent:
 
         def projector(messages: tuple[Message, ...]) -> tuple[Message, ...]:
             outcomes = self.skill_service.tool_outcomes if self.skill_service else {}
-            return project_durable_skill_messages(messages, outcomes)
+            return project_durable_skill_messages(
+                messages, outcomes, original_user_message=turn.user_message
+            )
 
         outcome = (
             self.manager.commit(turn, assistant_message, projector)

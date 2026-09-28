@@ -114,3 +114,27 @@ def test_durable_skill_projection_keeps_live_body_and_replaces_only_known_result
     assert isinstance(durable_result.content[0], TextBlock)
     assert live_result.content[0].text == "private Skill body"
     assert "private Skill body" not in durable_result.content[0].text
+
+
+def test_direct_skill_projection_preserves_exact_original_without_text_search() -> None:
+    manager = ConversationManager()
+    manager.create(_resolved())
+    original = "Question containing --- and the same Skill body text."
+    turn = manager.begin_turn(original)
+    suffix = (
+        "---\nname: review\n---\nSkill body text.\n\n<retrieved-skills>metadata</retrieved-skills>"
+    )
+    manager.append_live_user_context(turn, suffix)
+    request = manager.snapshot_for_request(turn)
+    live_text = "".join(block.text for block in request[0].content if isinstance(block, TextBlock))
+    assert live_text == original + "\n\n" + suffix
+    outcome = manager.commit(
+        turn,
+        Message(Role.ASSISTANT, (TextBlock("done"),)),
+        lambda live: project_durable_skill_messages(
+            live, {}, original_user_message=turn.user_message
+        ),
+    )
+    assert outcome.live_messages[0] == request[0]
+    assert outcome.durable_messages[0] == Message(Role.USER, (TextBlock(original),))
+    assert manager.snapshot_committed() == outcome.durable_messages

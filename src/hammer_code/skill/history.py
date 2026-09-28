@@ -9,10 +9,16 @@ from hammer_code.skill.models import SkillLoadOutcome
 
 
 def project_durable_skill_messages(
-    live_messages: tuple[Message, ...], outcomes: Mapping[str, SkillLoadOutcome]
+    live_messages: tuple[Message, ...],
+    outcomes: Mapping[str, SkillLoadOutcome],
+    *,
+    original_user_message: Message | None = None,
 ) -> tuple[Message, ...]:
     projected: list[Message] = []
-    for message in live_messages:
+    for position, message in enumerate(live_messages):
+        if position == 0 and original_user_message is not None:
+            projected.append(original_user_message)
+            continue
         blocks = []
         for block in message.content:
             outcome = outcomes.get(block.call_id) if isinstance(block, ToolResultBlock) else None

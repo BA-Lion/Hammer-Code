@@ -191,10 +191,17 @@ PermissionService 控制。详见 `.ai/doc/subagent/execution-and-results.md`。
 完整 Skill 正文只在加载它的当前顶层轮次可见：同轮后续模型请求仍可见，轮次结束后 Conversation 和
 Session 仅保存 scope/name/version 加载回执，下一顶层轮次必须重新调用 `use_skill` 或 `/skill`。
 检索使用轮次开始的 metadata snapshot，调用在首次加载时解析最新发布版本，并在同轮去重。
+直接 inline `/skill` 将调用时的 front matter 和参数替换后的正文放在本轮 live 用户问题之后；
+后续请求复用同一内容，收尾时 durable 用户消息恢复原问题。后台 Evaluator/Extractor 复用冻结的
+live 消息和实际检索元数据；同轮跨 `/skill` 与 `use_skill` 重复调用只返回首次版本的短回执。
 
-`record.jsonl` 是不含 Skill body、完整消息和用户原文的事件事实源；`usage.json` v2 可由它重建。
+`record.jsonl` 保存不含 Skill body、完整消息和用户原文的事件事实；`usage.json` v2 保留 lifetime
+和当前版本统计。运行时只归并新事件；add/merge 和启动时依据当前 Skill 校准版本，不从全量 record
+重建 usage。旧版本评价仍更新 lifetime，但不写新版计数、applied 时间或最近五次窗口。
 retrieve/loaded 由程序记录，relevant/applied 由独立 Evaluator 裁决。generated Skill 仅在当前版本最近
 五次已裁决召回持续超过 `prune_unapplied_days`（默认 30）仍未 applied 时可恢复 prune。
+其他在途评价不阻止归档；归档保留 usage，同版本的迟到评价继续记账。单笔 journal 恢复按当前文件的
+身份与哈希补齐遗漏的辅助步骤，无法证明时隔离 journal 并保留当前有效 Skill。
 
 通用文件工具会在授权前拒绝 `.hammer-code/skill/`；Memory 仅保留一般只读入口。Shell 只有提示词约束，
 不是 OS 级隔离。首次运行本开发版本会一次性删除不兼容的 `sessions` 和 `skill/state`，并写入 schema

@@ -401,9 +401,6 @@ class SkillEvolutionService:
             evidence = item.evidence
             if evidence is not None:
                 stage = "Evaluator"
-                await self.repository.reserve_evaluation(
-                    tuple(item.ref for item in evidence.retrieved)
-                )
                 try:
                     evaluator = await self._validated(
                         "Evaluator",
@@ -421,14 +418,20 @@ class SkillEvolutionService:
                         retrieve_event_ids=evidence.retrieve_event_ids,
                         loaded_event_ids=tuple(item.event_id for item in evidence.loaded),
                     )
-                    await self.repository.prune_eligible(self.config)
                 except Exception:
-                    await self.repository.record_evaluation((), (), failure_stage="evaluator")
+                    try:
+                        await self.repository.record_evaluation((), (), failure_stage="evaluator")
+                    except Exception:
+                        # An auxiliary write failure must not suppress Extractor.
+                        pass
                     self._warn_failure("Evaluator")
-                finally:
-                    await self.repository.release_evaluation(
-                        tuple(item.ref for item in evidence.retrieved)
-                    )
+                else:
+                    try:
+                        await self.repository.prune_eligible(
+                            self.config, can_write=lambda: _can_write(self.config, self.permissions)
+                        )
+                    except Exception:
+                        self._warn_failure("prune")
             stage = "Extractor"
             extractor = await self._validated(
                 "Extractor",
@@ -441,6 +444,7 @@ class SkillEvolutionService:
                     if previous and previous.completed
                     else (),
                     item.feedback,
+                    evidence.retrieved_prompt if evidence is not None else "",
                 ),
                 item.messages,
             )
@@ -550,4 +554,6 @@ class SkillEvolutionService:
         await self.repository.commit(prepared, expected_snapshot=snapshot)
         # Pruning is evaluated only after a successful, fully published write;
         # its own repository lock rechecks source, version, and preimage.
-        await self.repository.prune_eligible(self.config)
+        await self.repository.prune_eligible(
+            self.config, can_write=lambda: _can_write(self.config, self.permissions)
+        )

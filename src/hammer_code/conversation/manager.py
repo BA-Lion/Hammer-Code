@@ -84,6 +84,14 @@ class ConversationManager:
         self._assert_active(turn)
         return tuple(turn.staged_messages)
 
+    def append_live_user_context(self, turn: TurnTransaction, suffix: str) -> None:
+        """Enrich only the initial live input, retaining its exact durable original."""
+        self._assert_active(turn)
+        if len(turn.staged_messages) != 1:
+            raise ConversationError("Live user context must precede the first model request")
+        original = turn.user_message.content
+        turn.staged_messages[0] = Message(Role.USER, (*original, TextBlock("\n\n" + suffix)))
+
     def replace_committed_history(
         self, expected: tuple[Message, ...], replacement: tuple[Message, ...]
     ) -> None:

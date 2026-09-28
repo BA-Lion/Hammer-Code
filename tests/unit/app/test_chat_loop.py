@@ -1,12 +1,21 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from hammer_code.app.agent import PrimaryAgent
 from hammer_code.app.context_manager import ContextPreparation
 from hammer_code.app.context_window import ContextWindow
-from hammer_code.config import AppConfig, SubagentConfig, resolve_profile
+from hammer_code.config import (
+    AppConfig,
+    ContextConfig,
+    SkillConfig,
+    SubagentConfig,
+    resolve_profile,
+)
 from hammer_code.conversation.manager import ConversationManager
 from hammer_code.domain.events import (
     ModelEvent,
@@ -32,6 +41,12 @@ from hammer_code.domain.usage import TokenUsage, UsageStatus
 from hammer_code.errors import TransportError
 from hammer_code.llm.client import ClientCapabilities, ModelClient
 from hammer_code.permissions.models import ApprovalChoice
+from hammer_code.session.manager import SessionManager
+from hammer_code.session.session import SessionCoordinator
+from hammer_code.skill.models import SkillDefinition, SkillScope, SkillSource, SkillTurnEvidence
+from hammer_code.skill.repository import SkillRepository
+from hammer_code.skill.service import SkillInvocationService
+from hammer_code.skill.store import PreparedSkillWrite
 from hammer_code.subagent.service import BackgroundTaskManager
 from hammer_code.tools.base import ToolExecutionResult
 from hammer_code.tools.builtin.files import ReadFileTool
@@ -169,6 +184,203 @@ class CancelledExecutor:
         raise ToolBatchCancelled(
             (ToolResultBlock(calls[0].call_id, (TextBlock("cancelled"),), True),)
         )
+
+
+class _DirectSkillClient(FakeClient):
+    def __init__(self, ending: str) -> None:
+        super().__init__()
+        self.ending = ending
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            if self.ending == "abort":
+                raise TransportError("synthetic failure before tool exchange")
+            call = ToolCallBlock(
+                "skill-call",
+                "use_skill",
+                {"name": "review", "arguments": "changed"},
+                '{"name":"review","arguments":"changed"}',
+            )
+            yield ToolCallCompleted(request.request_id, 0, call)
+            message, reason = Message(Role.ASSISTANT, (call,)), StopReason.TOOL_CALL
+        else:
+            if self.ending == "interrupt":
+                raise asyncio.CancelledError
+            if self.ending == "error":
+                raise TransportError("synthetic failure after tool exchange")
+            message, reason = Message(Role.ASSISTANT, (TextBlock("done"),)), StopReason.END_TURN
+        yield ResponseCompleted(
+            request.request_id,
+            ModelResponse("provider", "model", message, reason, TokenUsage(1, 1)),
+        )
+
+
+class _DirectSkillExecutor:
+    def __init__(self, service: SkillInvocationService) -> None:
+        self.service = service
+
+    async def execute_batch(self, calls: tuple[ToolCallBlock, ...]) -> tuple[ToolResultBlock, ...]:
+        results = []
+        for call in calls:
+            result = await self.service.invoke("review", "changed")
+            self.service.observe_tool_result(call, call.arguments, result)
+            results.append(
+                ToolResultBlock(call.call_id, (TextBlock(result.content),), result.is_error)
+            )
+        return tuple(results)
+
+
+class _EvidenceSink:
+    def __init__(self) -> None:
+        self.items: list[SkillTurnEvidence] = []
+
+    def schedule_evidence(self, evidence: SkillTurnEvidence, current_input: str) -> None:
+        self.items.append(evidence)
+
+
+class _ProjectionCoordinator(SessionCoordinator):
+    def __init__(self, session, manager) -> None:
+        super().__init__(session, manager)
+        self.received: list[tuple[Message, ...]] = []
+
+    async def append_turn(self, messages: tuple[Message, ...], *, completed: bool) -> None:
+        self.received.append(messages)
+        await super().append_turn(messages, completed=completed)
+
+
+@pytest.mark.asyncio
+async def test_degraded_usage_does_not_disable_model_skill_invocation(tmp_path: Path) -> None:
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    definition = SkillDefinition(
+        "review",
+        "Review a change",
+        "0.1.0",
+        now,
+        now,
+        SkillSource.MANUAL,
+        "Valid current body despite auxiliary damage.",
+        SkillScope.PROJECT,
+        tmp_path / ".hammer-code" / "skill" / "project" / "review",
+    )
+    await repository.commit(PreparedSkillWrite("add", definition, None, "test", "degraded-op"))
+    repository.store.usage_path.write_text("invalid", encoding="utf-8")
+    await repository.initialize()
+    assert repository.state_degraded
+    service = SkillInvocationService(repository, SkillConfig(), ContextConfig())
+    client, manager, ui = _DirectSkillClient("complete"), _manager(), FakeUI()
+    agent = PrimaryAgent(
+        manager,
+        client,
+        ui,
+        "system",
+        100,
+        executor=_DirectSkillExecutor(service),  # type: ignore[arg-type]
+        skill_service=service,
+    )
+    await agent.run_turn("review")
+    assert len(client.requests) == 2
+    assert "Valid current body despite auxiliary damage." in str(client.requests[1].messages)
+    assert "Valid current body" not in str(manager.snapshot_committed())
+    assert any("remain callable" in warning for warning in ui.errors)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "interrupt", "error", "abort"])
+async def test_direct_skill_actual_live_request_and_session_projection(
+    tmp_path: Path,
+    ending: str,
+) -> None:
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    definition = SkillDefinition(
+        "review",
+        "Review a change",
+        "0.1.0",
+        now,
+        now,
+        SkillSource.MANUAL,
+        "Transient direct body for {{arguments}}.",
+        SkillScope.PROJECT,
+        tmp_path / ".hammer-code" / "skill" / "project" / "review",
+    )
+    await repository.commit(PreparedSkillWrite("add", definition, None, "test", "direct-op"))
+    service = SkillInvocationService(repository, SkillConfig(), ContextConfig())
+    manager = _manager()
+    session = SessionManager(tmp_path).create(manager.conversation.protocol)  # type: ignore[union-attr]
+    coordinator = _ProjectionCoordinator(session, manager)
+    client = _DirectSkillClient(ending)
+    sink = _EvidenceSink()
+    agent = PrimaryAgent(
+        manager,
+        client,
+        FakeUI(),
+        "system",
+        100,
+        executor=_DirectSkillExecutor(service),  # type: ignore[arg-type]
+        skill_service=service,
+        skill_evolution=sink,  # type: ignore[arg-type]
+        session_coordinator=coordinator,
+    )
+    if ending == "interrupt":
+        with pytest.raises(asyncio.CancelledError):
+            await agent.run_skill("review", "original")
+    else:
+        await agent.run_skill("review", "original")
+    assert len(client.requests) == (1 if ending == "abort" else 2)
+    for request in client.requests:
+        text = "".join(
+            block.text for block in request.messages[0].content if isinstance(block, TextBlock)
+        )
+        assert text.startswith("/skill review original\n\n---\nname: review\n")
+        assert text.index("version: 0.1.0") < text.index("Transient direct body for original.")
+        assert text.count("Transient direct body") == 1
+        assert "Transient direct body" not in request.system_prompt
+    durable = manager.snapshot_committed()
+    if ending == "abort":
+        assert durable == () and session.load().messages == ()
+    else:
+        assert durable[0] == Message(Role.USER, (TextBlock("/skill review original"),))
+        assert "Transient direct body" not in str(durable)
+        assert "Skill loaded for this turn: project:review@0.1.0" in str(durable)
+        assert coordinator.received == [durable]
+        # The existing Session reader excludes a tool suffix ending at EOF;
+        # this repair preserves that recovery policy and its schema.
+        expected_restore = durable if ending == "complete" else ()
+        assert session.load().messages == expected_restore
+        restored_manager = _manager()
+        restored_manager.clear()
+        restored_manager.conversation = None
+        restored_manager.restore(
+            type(
+                "Profile", (), {"name": "main", "protocol": session.meta.protocol, "model": "model"}
+            )(),
+            session.load().messages,
+            0,
+        )
+        assert restored_manager.snapshot_committed() == expected_restore
+    if ending == "complete":
+        assert len(sink.items) == 1
+        evidence = sink.items[0]
+        assert evidence.live_messages[0] == client.requests[0].messages[0]
+        assert evidence.retrieved == () and evidence.retrieved_prompt == ""
+        assert len(evidence.loaded) == 1
+        assert evidence.loaded[0].body == "Transient direct body for original."
+        assert "Skill already loaded" in str(evidence.live_messages[2])
+    else:
+        assert not sink.items
+    records = [
+        json.loads(line)
+        for line in repository.store.record_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(event["event_type"] == "loaded" for event in records) == 1
+    assert all(event["event_type"] != "retrieve" for event in records)
+    await coordinator.close()
+    assert session.load().messages == (durable if ending == "complete" else ())
 
 
 class _NonCompactingContext:
