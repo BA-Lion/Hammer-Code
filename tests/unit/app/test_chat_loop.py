@@ -47,6 +47,7 @@ from hammer_code.skill.models import SkillDefinition, SkillScope, SkillSource, S
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.skill.service import SkillInvocationService
 from hammer_code.skill.store import PreparedSkillWrite
+from hammer_code.skill.tool import UseSkillTool
 from hammer_code.subagent.service import BackgroundTaskManager
 from hammer_code.tools.base import ToolExecutionResult
 from hammer_code.tools.builtin.files import ReadFileTool
@@ -217,6 +218,17 @@ class _DirectSkillClient(FakeClient):
         )
 
 
+class _CatalogClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        self.requests.append(request)
+        async for event in super().stream(request):
+            yield event
+
+
 class _DirectSkillExecutor:
     def __init__(self, service: SkillInvocationService) -> None:
         self.service = service
@@ -248,6 +260,64 @@ class _ProjectionCoordinator(SessionCoordinator):
     async def append_turn(self, messages: tuple[Message, ...], *, completed: bool) -> None:
         self.received.append(messages)
         await super().append_turn(messages, completed=completed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enabled", "exposed"), [(True, True), (False, True), (True, False)])
+async def test_full_skill_catalog_without_retrieval_is_transient_and_refreshes(
+    tmp_path: Path, enabled: bool, exposed: bool
+) -> None:
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+    stamp = datetime(2026, 10, 19, tzinfo=UTC)
+
+    async def add(name: str) -> None:
+        definition = SkillDefinition(
+            name,
+            f"Description {name}",
+            "0.1.0",
+            stamp,
+            stamp,
+            SkillSource.MANUAL,
+            f"Private body {name}",
+            SkillScope.PROJECT,
+            tmp_path / ".hammer-code" / "skill" / "project" / name,
+        )
+        await repository.commit(PreparedSkillWrite("add", definition, None, "test", name))
+
+    await add("review")
+    service = SkillInvocationService(repository, SkillConfig(enabled=enabled), ContextConfig())
+    registry = ToolRegistry(() if exposed else ("use_skill",))
+    registry.register(UseSkillTool())
+    client, manager, sink = _CatalogClient(), _manager(), _EvidenceSink()
+    agent = PrimaryAgent(
+        manager,
+        client,
+        FakeUI(),
+        "system",
+        100,
+        registry=registry,
+        skill_service=service,
+        skill_evolution=sink,  # type: ignore[arg-type]
+    )
+    await agent.run_turn("qzxv")
+    await add("analyze")
+    await agent.run_turn("qzxv")
+
+    first, second = client.requests
+    if enabled and exposed:
+        assert '"name": "review"' in first.system_prompt
+        assert '"name": "analyze"' not in first.system_prompt
+        assert '"name": "analyze"' in second.system_prompt
+        assert "Description review" in first.system_prompt
+    else:
+        assert "<skill-catalog-json>" not in first.system_prompt + second.system_prompt
+    assert "Private body" not in first.system_prompt + second.system_prompt
+    assert "<skill-catalog-json>" not in str(manager.snapshot_committed())
+    assert len(sink.items) == 2
+    assert all(item.retrieved == () and item.retrieved_prompt == "" for item in sink.items)
+    records = [json.loads(line) for line in repository.store.record_path.read_text().splitlines()]
+    assert all(event["event_type"] not in {"retrieve", "loaded"} for event in records)
 
 
 @pytest.mark.asyncio
@@ -315,12 +385,15 @@ async def test_direct_skill_actual_live_request_and_session_projection(
     coordinator = _ProjectionCoordinator(session, manager)
     client = _DirectSkillClient(ending)
     sink = _EvidenceSink()
+    registry = ToolRegistry()
+    registry.register(UseSkillTool())
     agent = PrimaryAgent(
         manager,
         client,
         FakeUI(),
         "system",
         100,
+        registry=registry,
         executor=_DirectSkillExecutor(service),  # type: ignore[arg-type]
         skill_service=service,
         skill_evolution=sink,  # type: ignore[arg-type]
@@ -340,6 +413,8 @@ async def test_direct_skill_actual_live_request_and_session_projection(
         assert text.index("version: 0.1.0") < text.index("Transient direct body for original.")
         assert text.count("Transient direct body") == 1
         assert "Transient direct body" not in request.system_prompt
+        assert request.system_prompt.count("<skill-catalog-json>") == 1
+        assert '"name": "review"' in request.system_prompt
     durable = manager.snapshot_committed()
     if ending == "abort":
         assert durable == () and session.load().messages == ()

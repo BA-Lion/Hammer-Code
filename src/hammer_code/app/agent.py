@@ -37,7 +37,7 @@ from hammer_code.session.session import SessionCoordinator
 from hammer_code.skill.evolution import SkillEvolutionService
 from hammer_code.skill.history import project_durable_skill_messages
 from hammer_code.skill.models import SkillObservation
-from hammer_code.skill.prompts import build_skill_request_prompt
+from hammer_code.skill.prompts import build_skill_catalog_prompt, build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepositoryError
 from hammer_code.skill.service import SkillInvocationService
 from hammer_code.subagent.models import ParentRequestSnapshot, empty_catalog_snapshot
@@ -309,6 +309,7 @@ class PrimaryAgent:
         call_count = 0
         unknown_count = 0
         skill_prompt = ""
+        skill_catalog_prompt = ""
         skill_started = False
         direct_skill_prompt = ""
         turn_error = ""
@@ -319,6 +320,12 @@ class PrimaryAgent:
             if self.skill_service is not None:
                 try:
                     skill_snapshot = await self.skill_service.repository.snapshot_for_turn()
+                    if (
+                        self.skill_service.skill_config.enabled
+                        and self.registry is not None
+                        and self.registry.exposed("use_skill")
+                    ):
+                        skill_catalog_prompt = build_skill_catalog_prompt(skill_snapshot)
                     retrieval_event_ids: tuple[str, ...] = ()
                     if skill is None:
                         index = skill_snapshot.index
@@ -386,6 +393,11 @@ class PrimaryAgent:
                     turn, "\n\n".join(part for part in (direct_skill_prompt, skill_prompt) if part)
                 )
                 skill_prompt = ""
+            # Catalog visibility is independent of BM25 evidence and remains in
+            # system context even when /skill injects its body into live input.
+            skill_prompt = "\n\n".join(
+                piece for piece in (skill_catalog_prompt, skill_prompt) if piece
+            )
             while request_count < 50:
                 request_count += 1
                 request_id = str(uuid4())
