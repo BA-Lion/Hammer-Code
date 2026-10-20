@@ -137,6 +137,12 @@ class Bm25Index:
             for item in selected
         )
 
+    def rank(
+        self, query: str, definitions: Iterable[SkillDefinition], top_k: int
+    ) -> tuple[RetrievedSkill, ...]:
+        """Positive-score lexical candidates without business relevance gates."""
+        return self.merge_candidates(query, definitions, top_k)
+
     def merge_candidates(
         self, query: str, definitions: Iterable[SkillDefinition], top_k: int
     ) -> tuple[RetrievedSkill, ...]:

@@ -7,7 +7,7 @@ import stat
 from pathlib import Path
 
 from hammer_code.skill.models import CatalogSnapshot, SkillDefinition, SkillScope
-from hammer_code.skill.parser import SkillParseError, parse_skill
+from hammer_code.skill.parser import SkillParseError, parse_skill_bytes
 from hammer_code.skill.retrieval import Bm25Index
 
 
@@ -50,10 +50,9 @@ class SkillCatalog:
                 raise SkillCatalogError("Skill directory could not be resolved") from exc
         return result
 
-    def fingerprint(self) -> str:
-        digest = hashlib.sha256()
+    def _read_files(self) -> tuple[tuple[SkillScope, Path, bytes], ...]:
+        entries: list[tuple[SkillScope, Path, bytes]] = []
         for scope in SkillScope:
-            root = self._scope_root(scope)
             for child in self._children(scope):
                 path = child / "SKILL.md"
                 if not path.is_file() or _is_reparse(path):
@@ -62,29 +61,40 @@ class SkillCatalog:
                     payload = path.read_bytes()
                 except OSError as exc:
                     raise SkillCatalogError("SKILL.md could not be fingerprinted") from exc
-                digest.update(scope.value.encode())
-                digest.update(b"\0")
-                digest.update(path.relative_to(root).as_posix().encode())
-                digest.update(b"\0")
-                digest.update(str(len(payload)).encode())
-                digest.update(hashlib.sha256(payload).digest())
+                entries.append((scope, path, payload))
+        return tuple(entries)
+
+    def _fingerprint(self, entries: tuple[tuple[SkillScope, Path, bytes], ...]) -> str:
+        digest = hashlib.sha256()
+        for scope, path, payload in entries:
+            digest.update(scope.value.encode())
+            digest.update(b"\0")
+            digest.update(path.relative_to(self._scope_root(scope)).as_posix().encode())
+            digest.update(b"\0")
+            digest.update(str(len(payload)).encode())
+            digest.update(hashlib.sha256(payload).digest())
         return digest.hexdigest()
 
+    def fingerprint(self) -> str:
+        return self._fingerprint(self._read_files())
+
     def build_snapshot(self, previous: CatalogSnapshot | None = None) -> CatalogSnapshot:
-        fingerprint = self.fingerprint()
+        entries = self._read_files()
+        fingerprint = self._fingerprint(entries)
         if previous is not None and previous.fingerprint == fingerprint:
             return previous
         definitions: dict[tuple[SkillScope, str], SkillDefinition] = {}
-        for scope in SkillScope:
-            for child in self._children(scope):
-                try:
-                    definition = parse_skill(child / "SKILL.md", scope)
-                except SkillParseError as exc:
-                    raise SkillCatalogError(f"Invalid Skill in {scope.value}: {exc}") from exc
-                identity = (scope, definition.name)
-                if identity in definitions:
-                    raise SkillCatalogError("Duplicate Skill name within one scope")
-                definitions[identity] = definition
+        content_hashes: dict[tuple[SkillScope, str], str] = {}
+        for scope, path, payload in entries:
+            try:
+                definition = parse_skill_bytes(payload, path, scope)
+            except (SkillParseError, OSError) as exc:
+                raise SkillCatalogError(f"Invalid Skill in {scope.value}: {exc}") from exc
+            identity = (scope, definition.name)
+            if identity in definitions:
+                raise SkillCatalogError("Duplicate Skill name within one scope")
+            definitions[identity] = definition
+            content_hashes[identity] = hashlib.sha256(payload).hexdigest()
         effective: dict[str, SkillDefinition] = {}
         for scope in (SkillScope.PROJECT, SkillScope.USER):
             for (_, name), definition in sorted(definitions.items(), key=lambda item: item[0][1]):
@@ -96,6 +106,7 @@ class SkillCatalog:
             effective,
             definitions,
             Bm25Index(definitions.values()),
+            content_hashes,
         )
 
     @staticmethod

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,9 +46,147 @@ from hammer_code.skill.models import (
     SkillSource,
     SkillTurnEvidence,
 )
+from hammer_code.skill.parser import serialize_skill
 from hammer_code.skill.prompts import build_skill_request_prompt
 from hammer_code.skill.repository import SkillRepository
+from hammer_code.skill.search import SkillSearchService
 from hammer_code.skill.store import PreparedSkillWrite
+
+
+def _merge_review(body: str = "Merged latest knowledge.") -> str:
+    operation = json.loads(_add())
+    operation.update(action="merge", target={"scope": "project", "name": "review"})
+    operation["skill"].update(name="review", body=body)
+    return json.dumps(operation)
+
+
+def _evolution(repository, client, warnings):
+    return SkillEvolutionService(
+        client,
+        repository,
+        cast(PermissionService, SimpleNamespace(mode=PermissionMode.UNATTENDED)),
+        cast(ConversationManager, SimpleNamespace()),
+        _config(),
+        100,
+        warning=warnings.append,
+    )
+
+
+async def test_maintenance_reloads_during_extractor_and_rebinds_feedback(
+    tmp_path: Path, skill_factory
+) -> None:
+    original = skill_factory("review", body="Old complete body.")
+    repo = SkillRepository(tmp_path)
+    await repo.initialize()
+
+    class Updating(_Client):
+        async def stream(self, request):
+            if not self.requests:
+                updated = replace(
+                    original, version="0.1.1", prompt_template="Latest complete body."
+                )
+                (original.skill_dir / "SKILL.md").write_text(
+                    serialize_skill(updated), encoding="utf-8"
+                )
+            async for event in super().stream(request):
+                yield event
+
+    client = Updating([_candidate("review"), _merge_review()])
+    warnings = []
+    service = _evolution(repo, client, warnings)
+    await service.feedback("project:review", "Improve it")
+    await service.wait_idle()
+    assert warnings == []
+    prompt = client.requests[1].system_prompt
+    assert "Latest complete body." in prompt and "Old complete body." not in prompt
+    assert '"version": "0.1.1"' in prompt
+    result = (await repo.snapshot_for_turn()).effective["review"]
+    assert result.version == "0.1.2"
+
+
+async def test_entire_catalog_change_during_maintenance_rejects_old_operation(
+    tmp_path: Path, skill_factory
+) -> None:
+    original = skill_factory("review", body="Preserved original.")
+    other = skill_factory("other", body="Other old body")
+    repo = SkillRepository(tmp_path)
+    await repo.initialize()
+
+    class Updating(_Client):
+        async def stream(self, request):
+            if len(self.requests) == 1:
+                (other.skill_dir / "SKILL.md").write_text(
+                    serialize_skill(
+                        replace(other, prompt_template="External update without version bump")
+                    ),
+                    encoding="utf-8",
+                )
+            async for event in super().stream(request):
+                yield event
+
+    client = Updating([_candidate("review"), _merge_review()])
+    warnings = []
+    service = _evolution(repo, client, warnings)
+    await service.feedback("project:review", "Improve it")
+    await service.wait_idle()
+    assert len(warnings) == 1 and "commit" in warnings[0]
+    current = (await repo.snapshot_for_turn()).effective["review"]
+    assert current.ref == original.ref and current.prompt_template == "Preserved original."
+
+
+async def test_search_returns_stale_identity_but_maintenance_reads_current_body(
+    tmp_path: Path, skill_factory
+) -> None:
+    original = skill_factory("review", body="Old body")
+    repo = SkillRepository(tmp_path)
+    await repo.initialize()
+    delegate = repo.search
+    queries = []
+
+    class UpdatingSearch(SkillSearchService):
+        async def search(self, query, top_k, **kwargs):
+            queries.append((query, top_k))
+            hits = await delegate.search(query, top_k, **kwargs)
+            (original.skill_dir / "SKILL.md").write_text(
+                serialize_skill(
+                    replace(original, prompt_template="Current full body without bump")
+                ),
+                encoding="utf-8",
+            )
+            return hits
+
+    repo.search = UpdatingSearch()
+    client = _Client([_candidate("review"), _maintenance_discard()])
+    warnings = []
+    service = _evolution(repo, client, warnings)
+    await service.feedback("project:review", "Improve it")
+    await service.wait_idle()
+    assert warnings == [] and queries[0][1] == 10
+    assert queries[0][0].metadata is not None
+    assert "Check {{arguments}}." not in queries[0][0].text
+    assert "Current full body without bump" in client.requests[1].system_prompt
+
+
+async def test_disappearing_explicit_target_does_not_add(tmp_path: Path, skill_factory) -> None:
+    original = skill_factory("review")
+    repo = SkillRepository(tmp_path)
+    await repo.initialize()
+
+    class Removing(_Client):
+        async def stream(self, request):
+            (original.skill_dir / "SKILL.md").unlink()
+            original.skill_dir.rmdir()
+            async for event in super().stream(request):
+                yield event
+
+    client = Removing([_candidate("review")])
+    warnings = []
+    service = _evolution(repo, client, warnings)
+    await service.feedback("project:review", "Improve it")
+    await service.wait_idle()
+    assert len(client.requests) == 1
+    assert len(warnings) == 1 and "Maintenance" in warnings[0]
+    assert not (await repo.snapshot_for_turn()).effective
 
 
 class _Client:

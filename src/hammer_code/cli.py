@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,8 +27,11 @@ from hammer_code.permissions.rules import RuleStore
 from hammer_code.permissions.service import PermissionService
 from hammer_code.project_instructions import ProjectInstructionLoader
 from hammer_code.session.manager import SessionManager
+from hammer_code.skill.embedding import EmbeddingError
+from hammer_code.skill.model_assets import prepare_model, vector_status
 from hammer_code.skill.repository import SkillRepository
 from hammer_code.skill.tool import UseSkillTool
+from hammer_code.skill.vector_runtime import SkillVectorRuntime
 from hammer_code.subagent.repository import SubagentRepository
 from hammer_code.tools.builtin import (
     CreateFileTool,
@@ -63,6 +67,16 @@ def parser() -> argparse.ArgumentParser:
     actions.add_argument(
         "--list-sessions", action="store_true", help="List saved sessions and exit"
     )
+    actions.add_argument(
+        "--prepare-skill-model",
+        action="store_true",
+        help="Prepare the pinned local Skill embedding model and exit",
+    )
+    actions.add_argument(
+        "--skill-vector-status",
+        action="store_true",
+        help="Show local Skill vector availability without loading or downloading",
+    )
     return value
 
 
@@ -72,11 +86,23 @@ async def _run(args: argparse.Namespace) -> int:
     mcp_manager = None
     worktree_manager = None
     agent_team_repository = None
+    vector_runtime = None
     try:
         path = discover_config(args.config)
         config = load_config(path)
         hook_definitions = load_hook_definitions(path.parent / "hooks.toml")
         workspace_root = path.parent.parent.resolve()
+        if getattr(args, "skill_vector_status", False):
+            status = vector_status(workspace_root)
+            status["enabled"] = config.skill.enabled and config.skill.vector.enabled
+            ui.info(json.dumps(status, ensure_ascii=False))
+            return 0
+        if getattr(args, "prepare_skill_model", False):
+            await prepare_model(workspace_root)
+            ui.info(
+                "Local Skill embedding model prepared. Future runs reuse these verified assets."
+            )
+            return 0
         try:
             await asyncio.to_thread(migrate_local_state, workspace_root)
         except LocalStateMigrationError as exc:
@@ -143,6 +169,12 @@ async def _run(args: argparse.Namespace) -> int:
         except Exception:
             ui.error("Skill storage is unavailable; continuing without Skill support.")
             skill_repository = None
+        if skill_repository is not None:
+            vector_runtime = SkillVectorRuntime(
+                skill_repository, config.skill.vector, getattr(ui, "skill_warning", lambda _: None)
+            )
+            if config.skill.enabled:
+                vector_runtime.start()
         factory = PrimaryAgentFactory(
             workspace_root=workspace_root,
             cwd=Path.cwd(),
@@ -166,55 +198,45 @@ async def _run(args: argparse.Namespace) -> int:
         )
         resume_id = getattr(args, "resume", None)
         current = await (factory.resume(resume_id) if resume_id else factory.create_new())
-    except HammerCodeError as exc:
-        if mcp_manager is not None:
-            try:
-                await mcp_manager.close()
-            except Exception:
-                pass
-        if client is not None:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-        if worktree_manager is not None:
-            await worktree_manager.close()
+    except (HammerCodeError, EmbeddingError) as exc:
+        await _close_resources(vector_runtime, mcp_manager, worktree_manager, client)
         ui.error(str(exc))
         return 2
     except OSError:
-        if mcp_manager is not None:
-            try:
-                await mcp_manager.close()
-            except Exception:
-                pass
-        if client is not None:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
-        if worktree_manager is not None:
-            await worktree_manager.close()
+        await _close_resources(vector_runtime, mcp_manager, worktree_manager, client)
         ui.error("Unable to resolve the project runtime paths.")
         return 2
-    ui.banner(
-        resolved.name,
-        resolved.profile.protocol,
-        resolved.profile.model,
-        urlparse(resolved.profile.base_url).netloc,
-    )
-    commands = CommandRegistry()
-    register_builtin_commands(commands)
+    except BaseException:
+        await _close_resources(vector_runtime, mcp_manager, worktree_manager, client)
+        raise
     try:
+        ui.banner(
+            resolved.name,
+            resolved.profile.protocol,
+            resolved.profile.model,
+            urlparse(resolved.profile.base_url).netloc,
+        )
+        commands = CommandRegistry()
+        register_builtin_commands(commands)
         mcp_manager.start()
         await ChatLoop(current, factory, commands, sessions, factory.memory_store, ui).run()
     finally:
-        try:
-            await mcp_manager.close()
-        finally:
-            if worktree_manager is not None:
-                await worktree_manager.close()
-            await client.aclose()
+        await _close_resources(vector_runtime, mcp_manager, worktree_manager, client)
     return 0
+
+
+async def _close_resources(vector_runtime, mcp_manager, worktree_manager, client) -> None:
+    for close in (
+        vector_runtime.aclose if vector_runtime is not None else None,
+        mcp_manager.close if mcp_manager is not None else None,
+        worktree_manager.close if worktree_manager is not None else None,
+        client.aclose if client is not None else None,
+    ):
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -12,8 +12,15 @@ disabled = []
 [skill]
 enabled = true
 retrieval_top_k = 3
+# Retained for old configuration compatibility; hybrid recommendations no longer
+# apply these BM25 relevance gates to either route or the fused results.
 retrieval_relative_floor = 0.60
 retrieval_query_coverage = 0.20
+
+[skill.vector]
+enabled = true
+refresh_interval_seconds = 1800
+query_timeout_seconds = 2.0
 
 [skill.evolution]
 enabled = true

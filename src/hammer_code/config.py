@@ -168,6 +168,13 @@ class SkillEvolutionConfig(BaseModel):
     prune_unapplied_days: int = Field(default=30, ge=1)
 
 
+class SkillVectorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    enabled: bool = True
+    refresh_interval_seconds: float = Field(default=1800, gt=0, allow_inf_nan=False)
+    query_timeout_seconds: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+
+
 class SkillConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     enabled: bool = True
@@ -175,6 +182,7 @@ class SkillConfig(BaseModel):
     retrieval_relative_floor: float = Field(default=0.60, gt=0, le=1)
     retrieval_query_coverage: float = Field(default=0.20, ge=0, le=1)
     evolution: SkillEvolutionConfig = SkillEvolutionConfig()
+    vector: SkillVectorConfig = SkillVectorConfig()
 
 
 class WorktreeConfig(BaseModel):

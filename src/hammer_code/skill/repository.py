@@ -18,6 +18,7 @@ from hammer_code.skill.models import (
     SkillRef,
     empty_snapshot,
 )
+from hammer_code.skill.search import SkillSearchService
 from hammer_code.skill.store import (
     CommitResult,
     PreparedSkillWrite,
@@ -39,6 +40,21 @@ class SkillRepository:
         self._lock = asyncio.Lock()
         self._state_degraded = False
         self._catalog_unavailable = False
+        self.search = SkillSearchService()
+        self._catalog_listener: Callable[[CatalogSnapshot], None] | None = None
+        self._notified_fingerprint = ""
+
+    def bind_search(
+        self, search: SkillSearchService, listener: Callable[[CatalogSnapshot], None] | None = None
+    ) -> None:
+        self.search = search
+        self._catalog_listener = listener
+
+    def _notify_catalog(self) -> None:
+        if self._current.fingerprint != self._notified_fingerprint:
+            self._notified_fingerprint = self._current.fingerprint
+            if self._catalog_listener is not None:
+                self._catalog_listener(self._current)
 
     @property
     def state_degraded(self) -> bool:
@@ -61,6 +77,7 @@ class SkillRepository:
             try:
                 self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
                 self._catalog_unavailable = False
+                self._notify_catalog()
                 return self._current
             except SkillCatalogError as exc:
                 self._catalog_unavailable = True
@@ -208,6 +225,7 @@ class SkillRepository:
                 self._current = latest
                 result = await asyncio.to_thread(self.store.commit, prepared)
                 self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
+                self._notify_catalog()
                 return result
             except (SkillStoreError, SkillCatalogError) as exc:
                 raise SkillRepositoryError("Skill update could not be committed") from exc
@@ -220,6 +238,7 @@ class SkillRepository:
                     self.store.commit_prune, definition, expected_preimage
                 )
                 self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
+                self._notify_catalog()
                 return result
             except (SkillStoreError, SkillCatalogError) as exc:
                 raise SkillRepositoryError("Skill prune could not be committed") from exc
@@ -229,6 +248,7 @@ class SkillRepository:
             try:
                 await asyncio.to_thread(self.store.restore_pruned, definition, pruned_at)
                 self._current = await asyncio.to_thread(self.catalog.build_snapshot, self._current)
+                self._notify_catalog()
             except (SkillStoreError, SkillCatalogError) as exc:
                 raise SkillRepositoryError("Pruned Skill could not be restored") from exc
 
@@ -288,6 +308,7 @@ class SkillRepository:
                     pruned.append(definition.ref)
                 if pruned:
                     self._current = await asyncio.to_thread(self.catalog.build_snapshot, current)
+                    self._notify_catalog()
                 return tuple(pruned)
             except (OSError, SkillStoreError, SkillCatalogError, ValueError) as exc:
                 raise SkillRepositoryError("Eligible Skill prune could not be committed") from exc

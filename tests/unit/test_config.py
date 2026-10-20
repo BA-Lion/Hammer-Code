@@ -216,6 +216,20 @@ def test_skill_evolution_config_is_opt_in_and_rejects_removed_legacy_keys() -> N
         SkillEvolutionConfig.model_validate({"prune_min_retrieve": 5})
 
 
+def test_skill_vector_config_defaults_and_bounds() -> None:
+    from hammer_code.config import SkillConfig, SkillVectorConfig
+
+    vector = SkillConfig().vector
+    assert vector.enabled and vector.refresh_interval_seconds == 1800
+    assert vector.query_timeout_seconds == 2
+    assert SkillConfig(retrieval_query_coverage=0.2).retrieval_query_coverage == 0.2
+    for value in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            SkillVectorConfig(refresh_interval_seconds=value)
+        with pytest.raises(ValueError):
+            SkillVectorConfig(query_timeout_seconds=value)
+
+
 def test_subagent_config_is_bounded_and_defaulted() -> None:
     from hammer_code.config import AppConfig, SubagentConfig
 

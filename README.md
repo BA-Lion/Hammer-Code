@@ -159,9 +159,43 @@ python -m uv run python -m hammer_code --help
 python -m uv run hammer-code --help
 ```
 
+## Skill 混合检索
+
+Skill 推荐共用 BM25 与本地向量两路检索，按等权 RRF 融合（排名常数 60）。普通请求每路最多
+6 个、最终最多推荐 3 个；自进化每路最多 20 个、最终最多提供 10 个相似候选。相同分数按
+scope/name 稳定排序，数量不足不补齐。普通查询只用当前输入，自进化只用候选的
+name/description/when-to-use；不新增 LLM 总结请求，也不分块。
+
+本地 CPU 模型作为可选功能安装，一次显式准备后离线复用：
+
+```powershell
+python -m uv sync --all-groups --extra vector
+python -m uv run --extra vector hammer-code --prepare-skill-model
+python -m uv run --extra vector hammer-code --skill-vector-status
+python -m uv run --extra vector hammer-code
+```
+
+模型固定为 multilingual-e5-small 的已校验 ONNX 资产，约 487 MB，保存在项目
+`.hammer-code/skill/state/models/`；向量缓存保存在同目录树的 `embeddings.sqlite3`。
+准备和状态命令不需要聊天模型密钥，不创建 Session。状态命令只检查文件存在性，真实加载时校验
+完整性。日常启动不下载；缺依赖、缺模型、缓存失败或向量查询超时均降级到 BM25，全量 Skill
+目录与受控加载照常可用。`--extra vector` 确保安装向量依赖；普通 `uv run` 默认保留已安装的额外包，
+因此依赖和模型准备齐全后也可直接启动。`uv sync` 默认精确同步，未指定该 extra 时可能移除向量依赖。
+
+`[skill.vector]` 支持 `enabled`（默认 true）、`refresh_interval_seconds`（默认 1800）和
+`query_timeout_seconds`（默认 2.0）。启动与目录变化触发后台刷新，每 30 分钟再全量回刷兜底；
+索引可以陈旧，Skill 文件仍为事实源。模型、队列和刷新任务跨 Session 共享，在进程退出时关闭。
+首版暂不按相似度阈值排除推荐，无关输入也可能收到建议，由主模型判断是否加载。原
+`retrieval_relative_floor`/`retrieval_query_coverage` 仅保留配置解析兼容，不再过滤混合建议。
+
+Maintenance 会在检索后重新读取候选的最新完整正文；模型返回后，若活动目录内容已变化，则
+拒绝提交旧结果。只有显式 `/feedback` 绑定强制目标；相似检索不强制合并。向量缓存每条仅保存
+scope/name/完整向量/更新时间，整条原子 UPSERT，不迁移 Skill、usage 或 history。
+
 ## 验证与构建
 
-所有自动化测试均为合成事件，不会联网，也不需要真实密钥：
+默认自动化测试使用模拟事件和临时数据，不下载模型，也不需要真实密钥。真实本地模型集成测试
+仅在显式设置 `HAMMER_CODE_TEST_MODEL_ROOT` 指向已准备的临时项目后运行，不使用当前项目真实 Skill：
 
 ```powershell
 python -m uv run ruff format --check .

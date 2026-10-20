@@ -34,6 +34,7 @@ from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
 from hammer_code.prompts import build_stale_restore_prompt
 from hammer_code.session.session import SessionCoordinator
+from hammer_code.skill.embedding import EmbeddingQuery
 from hammer_code.skill.evolution import SkillEvolutionService
 from hammer_code.skill.history import project_durable_skill_messages
 from hammer_code.skill.models import SkillObservation
@@ -328,16 +329,13 @@ class PrimaryAgent:
                         skill_catalog_prompt = build_skill_catalog_prompt(skill_snapshot)
                     retrieval_event_ids: tuple[str, ...] = ()
                     if skill is None:
-                        index = skill_snapshot.index
                         retrieved = (
-                            index.retrieve(
-                                text,
-                                skill_snapshot.effective.values(),
-                                top_k=self.skill_service.skill_config.retrieval_top_k,
-                                relative_floor=self.skill_service.skill_config.retrieval_relative_floor,
-                                coverage_floor=self.skill_service.skill_config.retrieval_query_coverage,
+                            await self.skill_service.repository.search.search(
+                                EmbeddingQuery(text),
+                                self.skill_service.skill_config.retrieval_top_k,
+                                snapshot=skill_snapshot,
                             )
-                            if self.skill_service.skill_config.enabled and index is not None
+                            if self.skill_service.skill_config.enabled
                             else ()
                         )
                         if retrieved:

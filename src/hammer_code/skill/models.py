@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -72,10 +72,12 @@ class CatalogSnapshot:
     effective: Mapping[str, SkillDefinition]
     by_identity: Mapping[tuple[SkillScope, str], SkillDefinition]
     index: Bm25Index | None = None
+    content_hashes: Mapping[tuple[SkillScope, str], str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "effective", MappingProxyType(dict(self.effective)))
         object.__setattr__(self, "by_identity", MappingProxyType(dict(self.by_identity)))
+        object.__setattr__(self, "content_hashes", MappingProxyType(dict(self.content_hashes)))
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,9 @@ class RetrievedSkill:
     raw_score: float
     relative_score: float
     coverage: float
+    score_kind: Literal["bm25", "rrf"] = "bm25"
+    bm25_rank: int | None = None
+    vector_rank: int | None = None
 
 
 @dataclass(frozen=True)

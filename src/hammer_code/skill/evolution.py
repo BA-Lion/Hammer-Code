@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -21,6 +20,7 @@ from hammer_code.llm.client import ModelClient
 from hammer_code.permissions.models import PermissionMode
 from hammer_code.permissions.service import PermissionService
 from hammer_code.skill.catalog import SkillCatalog
+from hammer_code.skill.embedding import EmbeddingQuery, SkillMetadata
 from hammer_code.skill.models import (
     CatalogSnapshot,
     EvaluatorResponse,
@@ -281,35 +281,43 @@ class SkillEvolutionService:
                 "Evaluator application identities do not exactly match loaded Skills"
             )
 
-    def _candidate_definitions(
+    async def _candidate_definitions(
         self,
         snapshot: CatalogSnapshot,
         candidate: ExtractedCandidate,
         update_target_ref: SkillRef | None,
-    ) -> tuple[SkillDefinition, ...]:
-        query = self._candidate_query(candidate)
-        matches = (
-            snapshot.index.normalized_merge_candidates(
-                query,
-                self._proposed_definition(candidate),
-                snapshot.by_identity.values(),
-                self.config.evolution.merge_candidate_top_k,
-            )
-            if snapshot.index
-            else ()
+    ) -> tuple[CatalogSnapshot, tuple[SkillDefinition, ...], SkillRef | None]:
+        matches = await self.repository.search.search(
+            EmbeddingQuery.from_metadata(
+                SkillMetadata(candidate.name, candidate.description, candidate.when_to_use)
+            ),
+            self.config.evolution.merge_candidate_top_k,
+            snapshot=snapshot,
+            purpose="maintenance",
         )
+        snapshot = await self.repository.snapshot_for_turn()
+        if update_target_ref is not None:
+            latest = snapshot.by_identity.get((update_target_ref.scope, update_target_ref.name))
+            if latest is None:
+                raise SkillEvolutionError("selected update target is unavailable")
+            update_target_ref = latest.ref
         refs = [item.ref for item in matches]
         if update_target_ref is not None and update_target_ref not in refs:
             refs.insert(0, update_target_ref)
         selected: list[SkillDefinition] = []
+        seen: set[tuple[SkillScope, str]] = set()
         update_target = (
             snapshot.by_identity.get((update_target_ref.scope, update_target_ref.name))
             if update_target_ref
             else None
         )
         for ref in refs:
+            identity = (ref.scope, ref.name)
+            if identity in seen:
+                continue
+            seen.add(identity)
             definition = snapshot.by_identity.get((ref.scope, ref.name))
-            if definition is None or definition.version != ref.version:
+            if definition is None:
                 continue
             prompt = build_maintenance_prompt(
                 candidate, tuple(selected + [definition]), update_target
@@ -328,7 +336,7 @@ class SkillEvolutionService:
             item.ref == update_target_ref for item in selected
         ):
             raise SkillEvolutionError("selected update target is unavailable")
-        return tuple(selected)
+        return snapshot, tuple(selected), update_target_ref
 
     @staticmethod
     def _candidate_query(candidate: ExtractedCandidate) -> str:
@@ -458,7 +466,8 @@ class SkillEvolutionService:
                 return
             stage = "Maintenance"
             update_target_ref = item.update_target_ref
-            candidates = self._candidate_definitions(
+            snapshot = await self.repository.snapshot_for_turn()
+            snapshot, candidates, update_target_ref = await self._candidate_definitions(
                 snapshot, extractor.candidate, update_target_ref
             )
             update_target = (
@@ -547,7 +556,9 @@ class SkillEvolutionService:
                 skill_dir=previous.skill_dir,
                 version=f"{major}.{minor}.{patch + 1}",
             )
-            preimage = hashlib.sha256((previous.skill_dir / "SKILL.md").read_bytes()).hexdigest()
+            preimage = snapshot.content_hashes.get((previous.scope, previous.name))
+            if preimage is None:
+                raise SkillEvolutionError("merge snapshot has no content preimage")
             prepared = PreparedSkillWrite(
                 "merge", definition, preimage, operation.evolution_note, str(uuid4())
             )

@@ -100,11 +100,20 @@ def parse_skill(path: Path, scope: SkillScope) -> SkillDefinition:
     try:
         if not path.is_file() or _is_reparse(path):
             raise SkillParseError("SKILL.md must be a regular non-reparse file")
-        text = path.read_text(encoding="utf-8")
+        payload = path.read_bytes()
     except UnicodeDecodeError as exc:
         raise SkillParseError("SKILL.md must be UTF-8") from exc
     except OSError as exc:
         raise SkillParseError("SKILL.md could not be read") from exc
+    return parse_skill_bytes(payload, path, scope)
+
+
+def parse_skill_bytes(payload: bytes, path: Path, scope: SkillScope) -> SkillDefinition:
+    """Parse bytes already read through the Catalog's trusted file boundary."""
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SkillParseError("SKILL.md must be UTF-8") from exc
     if "\x00" in text:
         raise SkillParseError("SKILL.md must not contain NUL")
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")

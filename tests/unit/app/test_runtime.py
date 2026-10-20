@@ -143,3 +143,27 @@ async def test_factory_resume_keeps_session_identity_and_restores_stale_flag(
         assert resumed.manager.conversation.protocol == "openai_chat_completions"
     finally:
         await resumed.cancel()
+
+
+async def test_sessions_share_skill_search_and_do_not_close_it(tmp_path: Path) -> None:
+    from hammer_code.config import SkillVectorConfig
+    from hammer_code.skill.repository import SkillRepository
+    from hammer_code.skill.vector_runtime import SkillVectorRuntime
+
+    factory = _factory(tmp_path)
+    repository = SkillRepository(tmp_path)
+    await repository.initialize()
+    runtime = SkillVectorRuntime(repository, SkillVectorConfig(enabled=False), lambda _: None)
+    runtime.start()
+    factory.skill_repository = repository
+    first = await factory.create_new()
+    second = await factory.create_new()
+    try:
+        assert first.skill_service is not None and second.skill_service is not None
+        assert first.skill_service.repository.search is second.skill_service.repository.search
+        await first.drain()
+        assert runtime.state != "closed"
+    finally:
+        await first.cancel()
+        await second.cancel()
+        await runtime.aclose()
